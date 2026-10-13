@@ -1,0 +1,43 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "display-p3:0.20000,0.21176,0.24706,1.00000",
+      "display-p3:0.07059,0.07451,0.09020,1.00000"
+    ]
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "needle.svg",
+          "name" : "needle",
+          "position" : { "scale" : 1, "translation-in-points" : [ 0, 0 ] }
+        }
+      ],
+      "shadow" : { "kind" : "neutral", "opacity" : 0.5 },
+      "translucency" : { "enabled" : true, "value" : 0.3 }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "arc-codex.svg",
+          "name" : "arc-codex",
+          "position" : { "scale" : 1, "translation-in-points" : [ 0, 0 ] }
+        },
+        {
+          "glass" : true,
+          "image-name" : "arc-claude.svg",
+          "name" : "arc-claude",
+          "position" : { "scale" : 1, "translation-in-points" : [ 0, 0 ] }
+        }
+      ],
+      "shadow" : { "kind" : "layer-color", "opacity" : 0.5 },
+      "translucency" : { "enabled" : true, "value" : 0.4 }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : [ "macOS" ]
+  }
+}
