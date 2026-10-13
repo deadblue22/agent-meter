@@ -3,17 +3,17 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Mac Monitor</string>
+    <string>Agent Meter</string>
     <key>CFBundleDisplayName</key>
-    <string>Mac Monitor</string>
+    <string>Agent Meter</string>
     <key>CFBundleIdentifier</key>
-    <string>io.github.deadblue22.mac-monitor</string>
+    <string>io.github.deadblue22.agent-meter</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIconName</key>
     <string>AppIcon</string>
     <key>CFBundleExecutable</key>
-    <string>MacMonitor</string>
+    <string>AgentMeter</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

@@ -6,7 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-struct MacMonitorApp: App {
+struct AgentMeterApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     init() {
@@ -17,7 +17,7 @@ struct MacMonitorApp: App {
     }
 
     var body: some Scene {
-        Window("Mac Monitor", id: "main") {
+        Window("Agent Meter", id: "main") {
             ContentView()
         }
         .defaultSize(width: 1040, height: 820)

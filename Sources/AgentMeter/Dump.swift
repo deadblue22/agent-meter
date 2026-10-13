@@ -1,6 +1,6 @@
 import Foundation
 
-/// `MacMonitor --dump`: samples once and prints the session tree, sorted by memory, as plain text.
+/// `AgentMeter --dump`: samples once and prints the session tree, sorted by memory, as plain text.
 enum Dump {
     static func run() {
         let report = Collector.collect()

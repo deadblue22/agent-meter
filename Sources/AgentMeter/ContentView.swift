@@ -11,7 +11,7 @@ enum SortKey: String, CaseIterable, Identifiable {
 struct Row: Identifiable {
     enum Source { case claude, codex, none }
 
-    /// What ending this row means; nil when ending is not offered (the apps themselves, their processes, Mac Monitor itself)
+    /// What ending this row means; nil when ending is not offered (the apps themselves, their processes, Agent Meter itself)
     enum KillKind { case claudeSession, leftovers, codexThread, process }
 
     let id: String
@@ -24,7 +24,7 @@ struct Row: Identifiable {
     let cpu: Double
     let memory: UInt64
     let pid: Int32?
-    /// Every process in the subtree (excluding Mac Monitor itself)
+    /// Every process in the subtree (excluding Agent Meter itself)
     let refs: [ProcessRef]
     let killKind: KillKind?
     var children: [Row]?

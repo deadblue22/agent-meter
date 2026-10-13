@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "MacMonitor",
+    name: "AgentMeter",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "MacMonitor",
-            path: "Sources/MacMonitor",
+            name: "AgentMeter",
+            path: "Sources/AgentMeter",
             linkerSettings: [.linkedLibrary("sqlite3")]
         )
     ]

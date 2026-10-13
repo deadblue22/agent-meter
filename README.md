@@ -1,12 +1,12 @@
-# Mac Monitor
+# Agent Meter
 
-<img src="Resources/AppIcon-preview.png" alt="Mac Monitor icon in light, dark, tinted and clear appearances" width="640">
+<img src="Resources/AppIcon-preview.png" alt="Agent Meter icon in light, dark, tinted and clear appearances" width="640">
 
 A small macOS app that shows which **Claude Code** and **Codex** sessions — and the processes and sub-agents
 they spawn — are using your CPU and memory.
 
 When you run many agent sessions in parallel, Activity Monitor shows dozens of `claude`, `node`, `vitest`, `tsc`
-and `npm` processes with no hint of which session started them. Mac Monitor groups them by session and labels each
+and `npm` processes with no hint of which session started them. Agent Meter groups them by session and labels each
 group with the session's name.
 
 ## Features
@@ -26,11 +26,11 @@ group with the session's name.
 ## Build
 
 ```bash
-./build.sh            # builds build/Mac Monitor.app
+./build.sh            # builds build/Agent Meter.app
 ./build.sh install    # also copies it to ~/Applications
 ```
 
-To print the same data as plain text: `swift build -c release && .build/release/MacMonitor --dump`
+To print the same data as plain text: `swift build -c release && .build/release/AgentMeter --dump`
 
 ## How it works
 
@@ -74,7 +74,7 @@ Select a row and press **End…** (⌘⌫), or right-click it:
 | Single process | Just that process |
 | Claude desktop app, Codex / ChatGPT app | Not offered |
 
-Mac Monitor sends `SIGTERM`, waits up to 3 seconds, then sends `SIGKILL` to whatever is still running, and
+Agent Meter sends `SIGTERM`, waits up to 3 seconds, then sends `SIGKILL` to whatever is still running, and
 refreshes. Before signaling, it checks each process's start time, so a PID that was reused since the last refresh
 is left alone. It never ends itself.
 
