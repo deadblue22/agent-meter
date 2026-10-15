@@ -1,6 +1,12 @@
 import AppKit
 import SwiftUI
 
+/// Height of every row in the lists, including the list's own insets (4 points above and below the content).
+/// Rows that have not been shown yet are assumed to be this tall; if they turn out taller or shorter, the list moves
+/// under the pointer as they scroll into view, so every row's content is given exactly the height that makes it this.
+let listRowHeight: CGFloat = 42
+let listRowContentHeight: CGFloat = listRowHeight - 8
+
 enum SortKey: String, CaseIterable, Identifiable {
     case memory = "Memory"
     case cpu = "CPU"
@@ -116,6 +122,13 @@ struct ContentView: View {
             Divider()
             if let report {
                 list(report)
+                Divider()
+                Text("Only your own processes are counted; processes owned by root or system accounts are not visible. Claude Code sub-agents run inside the session process, so their usage counts toward the session. Codex sub-agents are separate threads and appear under their parent.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
             } else {
                 ProgressView("Sampling (about \(String(format: "%.1f", Collector.sampleSeconds)) s)…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -257,11 +270,9 @@ struct ContentView: View {
                     Totals(count: others.count, cpu: others.reduce(0) { $0 + $1.cpu },
                            memory: others.reduce(0) { $0 + $1.memory })
                 }
-            } footer: {
-                Text("Only your own processes are counted; processes owned by root or system accounts are not visible. Claude Code sub-agents run inside the session process, so their usage counts toward the session. Codex sub-agents are separate threads and appear under their parent.")
-                    .foregroundStyle(.secondary)
             }
         }
+        .environment(\.defaultMinListRowHeight, listRowHeight)
         .contextMenu(forSelectionType: Row.ID.self) { ids in
             menu(ids.compactMap { rowsById[$0] })
         } primaryAction: { ids in
@@ -418,7 +429,7 @@ struct RowView: View {
             Spacer(minLength: 12)
             Totals(count: row.isSession ? row.processCount : nil, cpu: row.cpu, memory: row.memory)
         }
-        .padding(.vertical, 2)
+        .frame(height: listRowContentHeight)
     }
 }
 

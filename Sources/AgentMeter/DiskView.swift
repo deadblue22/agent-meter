@@ -192,6 +192,7 @@ struct DiskView: View {
                 }
             }
         }
+        .environment(\.defaultMinListRowHeight, listRowHeight)
         .contextMenu(forSelectionType: String.self) { ids in
             menu(ids.compactMap { byId[$0] })
         } primaryAction: { ids in
@@ -361,7 +362,7 @@ struct DiskRowView: View {
                             highlight: session.reclaimable > 0)
             }
         }
-        .padding(.vertical, 2)
+        .frame(height: listRowContentHeight)
     }
 
     private static func icon(_ kind: DiskItem.Kind) -> String {
