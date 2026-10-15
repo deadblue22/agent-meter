@@ -27,6 +27,10 @@ struct Row: Identifiable {
     /// Every process in the subtree (excluding Agent Meter itself)
     let refs: [ProcessRef]
     let killKind: KillKind?
+    /// The session is over (for a process: its session is), so Clean Up applies here
+    let isOver: Bool
+    /// Processes in this subtree that Clean Up ends; 0 with `isOver` means everything here is a shared service and kept
+    let cleanupCount: Int
     var children: [Row]?
 
     var pids: [Int32] { refs.map(\.pid) }
@@ -35,7 +39,10 @@ struct Row: Identifiable {
         let source: Source = (node.kind == .codex || node.kind == .codexApp) ? .codex : .claude
         let isApp = node.kind == .claudeApp || node.kind == .codexApp
         let subSessions = sort(node.children, by: sortKey).map { session($0, sortKey: sortKey) }
-        let processes = sort(node.processes, by: sortKey).map { process($0, source: source, killable: !isApp) }
+        let processes = sort(node.processes, by: sortKey).map {
+            process($0, source: source, killable: !isApp, isOver: node.isOver, cleanedUp: Cleanup.isTarget($0, in: node))
+        }
+        let children = subSessions + processes
         let killKind: KillKind? = switch node.kind {
         case .claude: node.isLeftover ? .leftovers : .claudeSession
         case .codex: .codexThread
@@ -43,16 +50,18 @@ struct Row: Identifiable {
         }
         return Row(id: node.id, source: source, title: node.title, detail: node.detail, isSession: true,
                    isBusy: node.isBusy, processCount: node.processCount, cpu: node.cpu, memory: node.memory,
-                   pid: nil, refs: (subSessions + processes).flatMap(\.refs), killKind: killKind,
-                   children: subSessions + processes)
+                   pid: nil, refs: children.flatMap(\.refs), killKind: killKind, isOver: node.isOver,
+                   cleanupCount: children.reduce(0) { $0 + $1.cleanupCount }, children: children)
     }
 
-    static func process(_ item: ProcessItem, source: Source, killable: Bool) -> Row {
+    static func process(_ item: ProcessItem, source: Source, killable: Bool, isOver: Bool = false,
+                        cleanedUp: Bool = false) -> Row {
         let isSelf = item.pid == getpid()
         return Row(id: "pid-\(item.pid)", source: source, title: item.name, detail: item.command, isSession: false,
                    isBusy: false, processCount: 1, cpu: item.cpu, memory: item.memory, pid: item.pid,
                    refs: isSelf ? [] : [ProcessRef(pid: item.pid, startTime: item.startTime)],
-                   killKind: killable && !isSelf ? .process : nil, children: nil)
+                   killKind: killable && !isSelf ? .process : nil, isOver: isOver, cleanupCount: cleanedUp ? 1 : 0,
+                   children: nil)
     }
 
     static func sort(_ nodes: [SessionNode], by key: SortKey) -> [SessionNode] {
@@ -70,7 +79,7 @@ struct Row: Identifiable {
         switch killKind {
         case .claudeSession:
             return ("End session “\(title)”?",
-                    "Ends the session process and every process attributed to it (\(size)), including services it started in the background. A desktop session can be reopened in Claude later.")
+                    "Ends the session process and every process attributed to it (\(size)), including services it started in the background. The conversation can be resumed later: reopen it in the desktop app, or run `claude --resume` for a CLI session.")
         case .leftovers:
             return ("End processes left by “\(title)”?",
                     "This session has already ended. The processes it left running will be ended (\(size)).")
@@ -84,14 +93,15 @@ struct Row: Identifiable {
 }
 
 struct ContentView: View {
-    @State private var report: Report?
+    @Binding var report: Report?
     @State private var loading = false
     @State private var sortKey = SortKey.memory
     @State private var selection = Set<Row.ID>()
     /// Expanded sessions, remembered by ID across refreshes
     @State private var expanded = Set<Row.ID>()
     @State private var pendingKill: Row?
-    @State private var killing = false
+    /// What is in progress besides sampling ("Ending processes…", "Cleaning up…"); nil when idle
+    @State private var working: String?
     /// Result of the last kill; cleared on the next manual refresh
     @State private var notice: String?
 
@@ -112,7 +122,7 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 860, minHeight: 560)
-        .task { await refresh() }
+        .task { if report == nil { await refresh() } }
         .confirmationDialog(pendingKill?.killPrompt?.title ?? "",
                             isPresented: Binding(get: { pendingKill != nil }, set: { if !$0 { pendingKill = nil } }),
                             titleVisibility: .visible,
@@ -136,18 +146,26 @@ struct ContentView: View {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
                 .keyboardShortcut("r", modifiers: .command)
-                .disabled(loading || killing)
+                .disabled(loading || working != nil)
                 Button(role: .destructive) {
                     pendingKill = selectedRow
                 } label: {
                     Label("End…", systemImage: "xmark.octagon")
                 }
                 .keyboardShortcut(.delete, modifiers: .command)
-                .disabled(selectedRow?.killPrompt == nil || loading || killing)
+                .disabled(selectedRow?.killPrompt == nil || loading || working != nil)
                 .help("End the selected session or process (⌘⌫)")
-                if loading || killing {
+                let targets = report.map(Cleanup.targets) ?? []
+                Button {
+                    Task { await cleanUp() }
+                } label: {
+                    Label(targets.isEmpty ? "Clean Up" : "Clean Up (\(targets.count))", systemImage: "sparkles")
+                }
+                .disabled(targets.isEmpty || loading || working != nil)
+                .help(cleanupHelp(targets))
+                if loading || working != nil {
                     ProgressView().controlSize(.small)
-                    Text(killing ? "Ending processes…" : "Sampling…").foregroundStyle(.secondary)
+                    Text(working ?? "Sampling…").foregroundStyle(.secondary)
                 } else if let report {
                     Text("\(report.time.formatted(date: .omitted, time: .standard)) · sampled over \(String(format: "%.1f", report.sampleSeconds)) s")
                         .foregroundStyle(.secondary)
@@ -307,11 +325,35 @@ struct ContentView: View {
     }
 
     private func terminate(_ row: Row) async {
-        killing = true
+        working = "Ending processes…"
         let refs = row.refs
         let outcome = await Task.detached(priority: .userInitiated) { Killer.terminate(refs) }.value
         notice = "“\(row.title)”: \(outcome.summary)"
-        killing = false
+        working = nil
+        selection.removeAll()
+        await refresh()
+    }
+
+    private func cleanupHelp(_ targets: [ProcessItem]) -> String {
+        let rule = "Clean Up ends, without asking: processes left by Claude Code sessions that have ended; Claude Code "
+            + "CLI sessions idle for 6 hours, except channel bots; processes of Codex threads that are archived or have "
+            + "had no activity for 24 hours. Shared services such as Colima, Docker and adb keep running."
+        guard !targets.isEmpty else { return "Nothing to clean up. " + rule }
+        return "Ends \(Format.processes(targets.count)), \(Format.bytes(targets.reduce(0) { $0 + $1.memory })) in total. " + rule
+    }
+
+    private func cleanUp() async {
+        working = "Cleaning up…"
+        // Decide on a fresh sample: since the last refresh a session may have been resumed and taken its processes back
+        let fresh = await Task.detached(priority: .userInitiated) { Collector.collect() }.value
+        let refs = Cleanup.targets(in: fresh).map { ProcessRef(pid: $0.pid, startTime: $0.startTime) }
+        if refs.isEmpty {
+            notice = "Clean Up: nothing to clean up"
+        } else {
+            let outcome = await Task.detached(priority: .userInitiated) { Killer.terminate(refs) }.value
+            notice = "Clean Up: \(outcome.summary)"
+        }
+        working = nil
         selection.removeAll()
         await refresh()
     }
@@ -361,9 +403,12 @@ struct RowView: View {
                     .frame(width: 56, alignment: .leading)
             }
             VStack(alignment: .leading, spacing: 1) {
-                Text(row.title)
-                    .fontWeight(row.isSession ? .medium : .regular)
-                    .lineLimit(1)
+                HStack(spacing: 5) {
+                    Text(row.title)
+                        .fontWeight(row.isSession ? .medium : .regular)
+                        .lineLimit(1)
+                    CleanupMark(row: row)
+                }
                 Text(row.detail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -374,6 +419,26 @@ struct RowView: View {
             Totals(count: row.isSession ? row.processCount : nil, cpu: row.cpu, memory: row.memory)
         }
         .padding(.vertical, 2)
+    }
+}
+
+/// Shows how Clean Up treats a row: a sparkle where it ends processes, a lock where it keeps a shared service
+struct CleanupMark: View {
+    let row: Row
+
+    var body: some View {
+        if row.cleanupCount > 0 {
+            Image(systemName: "sparkles")
+                .font(.caption)
+                .foregroundStyle(.teal)
+                .help(row.isSession ? "Clean Up ends \(Format.processes(row.cleanupCount)) here" : "Clean Up ends this process")
+        } else if row.isOver {
+            Image(systemName: "lock")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help(row.isSession ? "Session is over, but Clean Up keeps its shared services running"
+                                    : "Shared service: Clean Up keeps it running")
+        }
     }
 }
 

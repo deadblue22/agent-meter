@@ -55,6 +55,15 @@ enum Procs {
         )
     }
 
+    /// Current working directory of a process
+    static func workingDirectory(_ pid: Int32) -> String? {
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+        let path = cString(info.pvi_cdir.vip_path)
+        return path.isEmpty ? nil : path
+    }
+
     /// Command-line arguments, plus only the environment variables named in `keys` (all others are dropped).
     static func arguments(_ pid: Int32, environmentKeys keys: Set<String>) -> (arguments: [String], environment: [String: String])? {
         var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]

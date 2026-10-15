@@ -9,6 +9,8 @@ struct ProcessItem: Identifiable {
     let memory: UInt64
     /// Start time in seconds; checked before ending a process to make sure the PID was not reused
     let startTime: UInt64
+    /// A shared background service, or a process running under one; Clean Up leaves it alone
+    let isSharedService: Bool
 
     var id: Int32 { pid }
 }
@@ -25,7 +27,10 @@ struct SessionNode: Identifiable {
     let isBusy: Bool
     var processes: [ProcessItem]
     var children: [SessionNode]
-    /// The session has ended; only processes it started are left
+    /// Clean Up applies: a Claude Code session that has ended or is an idle CLI session, or a Codex thread that is
+    /// archived or idle. Its processes (for a live session, the session process too) are Clean Up candidates.
+    var isOver = false
+    /// The Claude Code session has ended; only processes it started are left
     var isLeftover = false
 
     var cpu: Double { processes.reduce(0) { $0 + $1.cpu } + children.reduce(0) { $0 + $1.cpu } }
@@ -98,6 +103,16 @@ enum Collector {
 
         func executable(_ pid: Int32) -> String { arguments[pid]?.first ?? processes[pid]?.name ?? "" }
 
+        var shared: [Int32: Bool] = [:]
+        func isSharedService(_ pid: Int32, depth: Int = 0) -> Bool {
+            if let cached = shared[pid] { return cached }
+            guard depth < 64, let process = processes[pid] else { return false }
+            let result = Cleanup.sharedServices.contains(process.name)
+                || (process.ppid > 1 && isSharedService(process.ppid, depth: depth + 1))
+            shared[pid] = result
+            return result
+        }
+
         // Attribution rules, first match wins:
         // 1. The process is a Claude Code session process itself
         // 2. Its environment carries a session ID (injected by Claude Code or Codex into tool commands);
@@ -143,7 +158,8 @@ enum Collector {
                 command: arguments[pid]?.joined(separator: " ") ?? process.name,
                 cpu: cpu[pid] ?? 0,
                 memory: process.memory,
-                startTime: process.startTime
+                startTime: process.startTime,
+                isSharedService: isSharedService(pid)
             )
             grouped[owner(pid), default: []].append(item)
         }
@@ -156,15 +172,21 @@ enum Collector {
             switch key {
             case .claude(let sessionId):
                 if let session = sessionById[sessionId] {
+                    let idle = session.status == "idle" ? session.statusSince.map { Date().timeIntervalSince($0) } : nil
+                    let isChannel = (arguments[session.pid] ?? []).contains { arg in
+                        Cleanup.channelFlags.contains { arg == $0 || arg.hasPrefix($0 + "=") }
+                    }
                     claudeNodes.append(SessionNode(
                         id: "claude-\(sessionId)",
                         kind: .claude,
                         title: session.name.isEmpty ? (session.cwd as NSString).lastPathComponent : session.name,
                         detail: [shortPath(session.cwd), session.entrypoint == "claude-desktop" ? "Desktop" : "CLI",
-                                 session.status == "busy" ? "Running" : "Idle"].joined(separator: " · "),
+                                 idle.map { "Idle for \(duration($0))" } ?? (session.status == "busy" ? "Running" : "Idle")]
+                            .joined(separator: " · "),
                         isBusy: session.status == "busy",
                         processes: items,
-                        children: []
+                        children: [],
+                        isOver: session.entrypoint == "cli" && !isChannel && (idle ?? 0) > Cleanup.cliIdleLimit
                     ))
                 } else {
                     claudeNodes.append(SessionNode(
@@ -175,6 +197,7 @@ enum Collector {
                         isBusy: false,
                         processes: items,
                         children: [],
+                        isOver: true,
                         isLeftover: true
                     ))
                 }
@@ -193,15 +216,14 @@ enum Collector {
         let threads = CodexThreads.load(codexIds)
         var codexNodes: [String: SessionNode] = [:]
         for (id, thread) in threads {
-            let title: String
-            if let nickname = thread.nickname, !nickname.isEmpty {
-                title = "Sub-agent \(nickname)" + (thread.role.map { " (\($0))" } ?? "")
-            } else {
-                title = thread.title.isEmpty ? "Thread \(id.prefix(8))" : String(thread.title.prefix(80))
-            }
-            codexNodes[id] = SessionNode(id: "codex-\(id)", kind: .codex, title: title,
-                                         detail: shortPath(thread.cwd), isBusy: false,
-                                         processes: grouped[.codex(id)] ?? [], children: [])
+            let idle = Date().timeIntervalSince(thread.updatedAt)
+            let isOver = thread.isArchived || idle > Cleanup.codexIdleLimit
+            let state = thread.isArchived ? "Archived" : isOver ? "No activity for \(duration(idle))" : nil
+            codexNodes[id] = SessionNode(id: "codex-\(id)", kind: .codex, title: thread.displayTitle,
+                                         detail: [thread.subAgentLabel, shortPath(thread.cwd), state]
+                                             .compactMap { $0 }.joined(separator: " · "),
+                                         isBusy: false, processes: grouped[.codex(id)] ?? [], children: [],
+                                         isOver: isOver)
         }
         for id in codexIds where threads[id] == nil {
             codexNodes[id] = SessionNode(id: "codex-\(id)", kind: .codex, title: "Thread \(id.prefix(8))",
@@ -244,6 +266,13 @@ enum Collector {
         if process.name == "disclaimer" { return "disclaimer (desktop launcher)" }
         let base = arguments?.first.map { ($0 as NSString).lastPathComponent } ?? ""
         return base.isEmpty ? process.name : base
+    }
+
+    private static func duration(_ seconds: TimeInterval) -> String {
+        let minutes = Int(seconds / 60)
+        if minutes < 60 { return "\(minutes) min" }
+        let hours = minutes / 60
+        return hours == 1 ? "1 hour" : hours < 48 ? "\(hours) hours" : "\(hours / 24) days"
     }
 
     static func shortPath(_ path: String) -> String {
