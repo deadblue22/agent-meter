@@ -7,6 +7,8 @@ enum DiskSize {
         var buckets: [UInt64]
         /// Every classified entry: its path relative to the root, its bucket and its size
         var classified: [(path: String, bucket: Int, bytes: UInt64)] = []
+        /// Bytes of bucket 0 by the first component of the path below the root; filled only when asked for
+        var topLevel: [String: UInt64] = [:]
     }
 
     /// Bytes allocated on disk under `path`, the figure `du` reports. A hard-linked file is counted once; symbolic
@@ -18,7 +20,7 @@ enum DiskSize {
     /// Walks `root` and sums the allocated bytes into buckets. `classify` is asked about every entry below the root
     /// (path relative to `root`, and whether it is a directory). Returning a bucket assigns the entry, and for a
     /// directory everything under it, to that bucket; returning nil counts the entry in bucket 0 and keeps descending.
-    static func measure(_ root: String, buckets: Int,
+    static func measure(_ root: String, buckets: Int, breakdown: Bool = false,
                         classify: (_ relativePath: String, _ isDirectory: Bool) -> Int?) -> Measurement {
         var result = Measurement(buckets: [UInt64](repeating: 0, count: buckets))
         guard let cRoot = strdup(root) else { return result }
@@ -44,9 +46,10 @@ enum DiskSize {
                 return !seen.insert(key).inserted
             }
 
+            var relative = ""
             if entry.pointee.fts_level > 0, let path = entry.pointee.fts_path {
                 let length = Int(entry.pointee.fts_pathlen)
-                let relative = path.withMemoryRebound(to: UInt8.self, capacity: length) {
+                relative = path.withMemoryRebound(to: UInt8.self, capacity: length) {
                     String(decoding: UnsafeBufferPointer(start: $0 + rootLength, count: max(length - rootLength, 0)),
                            as: UTF8.self)
                 }
@@ -63,7 +66,13 @@ enum DiskSize {
                     continue
                 }
             }
-            if !isRepeatedLink() { result.buckets[0] += blocks }
+            if !isRepeatedLink() {
+                result.buckets[0] += blocks
+                if breakdown, entry.pointee.fts_level > 0 {
+                    let name = relative.firstIndex(of: "/").map { String(relative[..<$0]) } ?? relative
+                    result.topLevel[name, default: 0] += blocks
+                }
+            }
         }
         return result
     }

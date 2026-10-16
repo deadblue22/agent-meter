@@ -17,6 +17,14 @@ enum DiskRemoval {
     case worktree(root: String)
 }
 
+/// A folder or file inside a part, to show where the space goes
+struct DiskEntry: Identifiable {
+    let path: String
+    let name: String
+    let bytes: UInt64
+    var id: String { path }
+}
+
 /// One kind of disk space a session occupies, with a verdict on whether it can be deleted
 struct DiskItem: Identifiable {
     enum Kind {
@@ -46,17 +54,20 @@ struct DiskItem: Identifiable {
     /// Nil for conversations, which are never deleted
     var removal: DiskRemoval?
     var owner: DiskOwner = .nobody
+    /// The largest folders and files inside, largest first
+    var entries: [DiskEntry] = []
 
-    var title: String {
-        let base = switch kind {
+    var baseTitle: String {
+        switch kind {
         case .scratch: "Scratch files"
         case .dependencies: "Dependencies and caches"
         case .worktree: "Worktree files"
         case .ignored: "Ignored files"
         case .history: "Conversation history"
         }
-        return subject.map { "\(base) · \($0)" } ?? base
     }
+
+    var title: String { subject.map { "\(baseTitle) · \($0)" } ?? baseTitle }
 }
 
 extension DiskItem {

@@ -45,6 +45,8 @@ enum ClaudeSessions {
         let sessionId: String
         let file: String
         let modified: Date
+        /// When the transcript file was created, which is when the session began
+        let created: Date
         /// Bytes the transcript file occupies
         let fileBytes: UInt64
         /// Companion directory `<id>/` (sub-agent transcripts, saved tool results); may not exist
@@ -60,11 +62,11 @@ enum ClaudeSessions {
         let dirs = (try? fm.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil)) ?? []
         var result: [Transcript] = []
         for dir in dirs {
-            let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .totalFileAllocatedSizeKey])) ?? []
+            let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey, .totalFileAllocatedSizeKey])) ?? []
             for file in files where file.pathExtension == "jsonl" {
                 let sessionId = file.deletingPathExtension().lastPathComponent
                 guard sessionId.count == 36 else { continue }
-                let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .totalFileAllocatedSizeKey])
+                let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey, .totalFileAllocatedSizeKey])
                 let directory = dir.appendingPathComponent(sessionId)
                 let subagents = ((try? fm.contentsOfDirectory(atPath: directory.appendingPathComponent("subagents").path)) ?? [])
                     .filter { $0.hasPrefix("agent-") && $0.hasSuffix(".jsonl") }
@@ -73,6 +75,7 @@ enum ClaudeSessions {
                     sessionId: sessionId,
                     file: file.path,
                     modified: values?.contentModificationDate ?? .distantPast,
+                    created: values?.creationDate ?? .distantPast,
                     fileBytes: UInt64(values?.totalFileAllocatedSize ?? 0),
                     directory: directory.path,
                     cwd: workingDirectory(ofTranscript: file),
@@ -81,6 +84,45 @@ enum ClaudeSessions {
             }
         }
         return result
+    }
+
+    /// The session that created the worktree at `root`, for a worktree no session has as its working directory (an agent
+    /// made it by hand, or a sub-agent did): among the sessions that were running when the directory was created, the
+    /// one whose conversation, or a sub-agent's, mentions its path first. Later mentions, such as a session that only
+    /// listed the worktrees, do not count.
+    static func creator(of root: String, among transcripts: [Transcript]) -> Transcript? {
+        guard let born = (try? FileManager.default.attributesOfItem(atPath: root))?[.creationDate] as? Date else { return nil }
+        let slack: TimeInterval = 600
+        let key = Array("/worktrees/\((root as NSString).lastPathComponent)".utf8)
+        var best: (transcript: Transcript, when: Date)?
+        for transcript in transcripts
+            where transcript.created <= born.addingTimeInterval(slack) && transcript.modified >= born.addingTimeInterval(-slack) {
+            let subagents = ((try? FileManager.default.contentsOfDirectory(atPath: transcript.directory + "/subagents")) ?? [])
+                .filter { $0.hasSuffix(".jsonl") }.map { transcript.directory + "/subagents/" + $0 }
+            for file in [transcript.file] + subagents {
+                guard let when = firstMention(of: key, in: file), when >= born.addingTimeInterval(-slack) else { continue }
+                if best == nil || when < best!.when { best = (transcript, when) }
+            }
+        }
+        return best?.transcript
+    }
+
+    /// When the first record that contains `key` was written
+    private static func firstMention(of key: [UInt8], in file: String) -> Date? {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: file), options: .mappedIfSafe) else { return nil }
+        let line: Data? = data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress, let hit = memmem(base, raw.count, key, key.count) else { return nil }
+            let offset = base.distance(to: hit)
+            var start = offset, end = offset
+            while start > 0, raw[start - 1] != UInt8(ascii: "\n") { start -= 1 }
+            while end < raw.count, raw[end] != UInt8(ascii: "\n") { end += 1 }
+            return Data(raw[start..<end])
+        }
+        guard let line, let stamp = line.range(of: Data("\"timestamp\":\"".utf8)) else { return nil }
+        let text = String(decoding: line[stamp.upperBound...].prefix(32), as: UTF8.self).split(separator: "\"").first.map(String.init)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return text.flatMap(formatter.date(from:))
     }
 
     /// The `cwd` of the first record that has one. Every record carries it, so the head of the file is enough.
@@ -131,7 +173,7 @@ struct CodexThread {
     /// The conversation log `~/.codex/sessions/.../rollout-*.jsonl`
     let rolloutPath: String
     let createdAt: Date
-    /// Sub-agents only: where the parent placed them, such as `/root/replay_bridge_source_audit`
+    /// Sub-agents only: where the parent placed them, such as `/root/review_billing_logic`
     let agentPath: String?
 
     /// What to show for the thread. Sub-agents have no title of their own, but the task name their parent gave them

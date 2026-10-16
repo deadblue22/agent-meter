@@ -32,6 +32,8 @@ struct SessionNode: Identifiable {
     var isOver = false
     /// The Claude Code session has ended; only processes it started are left
     var isLeftover = false
+    /// Not a session: detached processes working in a Claude Code worktree that no running session claims
+    var isUnclaimed = false
 
     var cpu: Double { processes.reduce(0) { $0 + $1.cpu } + children.reduce(0) { $0 + $1.cpu } }
     var memory: UInt64 { processes.reduce(0) { $0 + $1.memory } + children.reduce(0) { $0 + $1.memory } }
@@ -58,6 +60,8 @@ enum Collector {
         case codex(String)
         case claudeApp
         case codexApp
+        /// A worktree (its root) that holds detached processes but is not the working directory of a running session
+        case worktree(String)
         case unattributed
     }
 
@@ -103,6 +107,12 @@ enum Collector {
 
         func executable(_ pid: Int32) -> String { arguments[pid]?.first ?? processes[pid]?.name ?? "" }
 
+        // The running session that works in each worktree
+        var sessionByWorktree: [String: String] = [:]
+        for session in claudeSessions.values {
+            if let root = worktreeRoot(of: session.cwd) { sessionByWorktree[root] = session.sessionId }
+        }
+
         var shared: [Int32: Bool] = [:]
         func isSharedService(_ pid: Int32, depth: Int = 0) -> Bool {
             if let cached = shared[pid] { return cached }
@@ -119,7 +129,10 @@ enum Collector {
         //    this also catches leftovers that were detached from their parent
         // 3. The desktop app's `disclaimer` launcher belongs to the session it launched
         // 4. Walk up the parent chain
-        // 5. The Claude desktop app and the Codex / ChatGPT app themselves
+        // 5. A detached process (parent 1, such as a supervisor started with a cleared environment) whose working
+        //    directory is a Claude Code worktree: the running session that works in that worktree, or else the
+        //    worktree itself
+        // 6. The Claude desktop app and the Codex / ChatGPT app themselves
         var owners: [Int32: Owner] = [:]
         func owner(_ pid: Int32, depth: Int = 0) -> Owner {
             if let cached = owners[pid] { return cached }
@@ -138,6 +151,10 @@ enum Collector {
                 result = .claude(session)
             } else {
                 if process.ppid > 1 { result = owner(process.ppid, depth: depth + 1) }
+                if result == .unattributed, process.ppid <= 1, let cwd = Procs.workingDirectory(pid),
+                   let root = worktreeRoot(of: cwd) {
+                    result = sessionByWorktree[root].map { .claude($0) } ?? .worktree(root)
+                }
                 if result == .unattributed {
                     if exe.contains("/Claude.app/") {
                         result = .claudeApp
@@ -167,6 +184,7 @@ enum Collector {
         // Claude Code: running sessions, plus processes left behind by sessions that have ended
         let sessionById = Dictionary(claudeSessions.values.map { ($0.sessionId, $0) }, uniquingKeysWith: { a, _ in a })
         var claudeNodes: [SessionNode] = []
+        var transcripts: [ClaudeSessions.Transcript]?
         var codexIds = Set<String>()
         for (key, items) in grouped {
             switch key {
@@ -207,6 +225,18 @@ enum Collector {
                 claudeNodes.append(SessionNode(id: "claude-app", kind: .claudeApp, title: "Claude desktop app",
                                                detail: "UI, GPU, network and other helper processes", isBusy: false,
                                                processes: items, children: []))
+            case .worktree(let root):
+                // Which session made the worktree is worth saying, though it is not working in it any more
+                if transcripts == nil { transcripts = ClaudeSessions.transcripts() }
+                let creator = ClaudeSessions.creator(of: root, among: transcripts ?? []).map { transcript -> String in
+                    let live = sessionById[transcript.sessionId]?.name
+                    let title = live.flatMap { $0.isEmpty ? nil : $0 } ?? ClaudeSessions.title(ofEndedSession: transcript.sessionId)
+                    return "Made by “\(title ?? "session " + transcript.sessionId.prefix(8))”"
+                }
+                claudeNodes.append(SessionNode(
+                    id: "worktree-\(root)", kind: .claude, title: (root as NSString).lastPathComponent,
+                    detail: [creator, "no running session works in it", shortPath(root)].compactMap { $0 }.joined(separator: " · "),
+                    isBusy: false, processes: items, children: [], isUnclaimed: true))
             case .codexApp, .unattributed:
                 break
             }
@@ -259,6 +289,13 @@ enum Collector {
             codex: codexTree,
             others: grouped[.unattributed] ?? []
         )
+    }
+
+    /// `<repo>/.claude/worktrees/<name>`, when `path` is that or inside it
+    private static func worktreeRoot(of path: String) -> String? {
+        guard let range = path.range(of: "/.claude/worktrees/"),
+              let name = path[range.upperBound...].split(separator: "/").first else { return nil }
+        return String(path[..<range.upperBound]) + name
     }
 
     private static func displayName(pid: Int32, process: RawProcess, arguments: [String]?, isSession: Bool) -> String {

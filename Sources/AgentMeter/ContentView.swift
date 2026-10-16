@@ -18,7 +18,7 @@ struct Row: Identifiable {
     enum Source { case claude, codex, none }
 
     /// What ending this row means; nil when ending is not offered (the apps themselves, their processes, Agent Meter itself)
-    enum KillKind { case claudeSession, leftovers, codexThread, process }
+    enum KillKind { case claudeSession, leftovers, unclaimed, codexThread, process }
 
     let id: String
     let source: Source
@@ -50,7 +50,7 @@ struct Row: Identifiable {
         }
         let children = subSessions + processes
         let killKind: KillKind? = switch node.kind {
-        case .claude: node.isLeftover ? .leftovers : .claudeSession
+        case .claude: node.isUnclaimed ? .unclaimed : node.isLeftover ? .leftovers : .claudeSession
         case .codex: .codexThread
         case .claudeApp, .codexApp: nil
         }
@@ -89,6 +89,9 @@ struct Row: Identifiable {
         case .leftovers:
             return ("End processes left by “\(title)”?",
                     "This session has already ended. The processes it left running will be ended (\(size)).")
+        case .unclaimed:
+            return ("End processes running in “\(title)”?",
+                    "No running session works in this worktree. The detached processes in it will be ended (\(size)), for example a local stack started for acceptance.")
         case .codexThread:
             return ("End processes started by Codex thread “\(title)”?",
                     "Ends the processes started by this thread and its sub-agents (\(size)). The thread itself lives in the Codex app and is not affected.")
@@ -117,18 +120,21 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-                .padding(.horizontal, 14)
+                .buttonStyle(ThemeButtonStyle())
+                .padding(.horizontal, 16)
                 .padding(.vertical, 10)
-            Divider()
             if let report {
                 list(report)
-                Divider()
+                    .scrollContentBackground(.hidden)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .themedPanel()
+                    .padding(.horizontal, 16)
                 Text("Only your own processes are counted; processes owned by root or system accounts are not visible. Claude Code sub-agents run inside the session process, so their usage counts toward the session. Codex sub-agents are separate threads and appear under their parent.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 10)
             } else {
                 ProgressView("Sampling (about \(String(format: "%.1f", Collector.sampleSeconds)) s)…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -236,7 +242,7 @@ struct ContentView: View {
         let others = Row.sort(report.others, by: sortKey)
         let otherRows = otherRows(report)
         let hidden = others.dropFirst(otherLimit)
-        let claudeCount = report.claude.filter { $0.kind == .claude }.count
+        let claudeCount = report.claude.filter { $0.kind == .claude && !$0.isUnclaimed }.count
         let codexCount = report.codex.filter { $0.kind == .codex }.count
         let rowsById = rowsById(report)
 

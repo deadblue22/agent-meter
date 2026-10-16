@@ -34,6 +34,10 @@ enum DiskScanner {
         var ignoredNames: [String] = []
         /// The git-ignored dependency directories, relative to the worktree
         var dependencyPaths: [String] = []
+        /// Largest first: files by top-level folder, each dependency directory, ignored files by top-level folder
+        var fileEntries: [(name: String, bytes: UInt64)] = []
+        var dependencyEntries: [(name: String, bytes: UInt64)] = []
+        var ignoredEntries: [(name: String, bytes: UInt64)] = []
         var git: GitState?
     }
 
@@ -48,17 +52,31 @@ enum DiskScanner {
     private final class Results {
         private let lock = NSLock()
         private var finished = 0
+        private var weightDone = 0
         private(set) var worktrees: [String: WorktreeUsage] = [:]
         private(set) var sizes: [String: UInt64] = [:]
         private(set) var owners: [String: String?] = [:]
+        private(set) var breakdowns: [String: [String: UInt64]] = [:]
+
+        func store(breakdown: [String: UInt64], at path: String) { lock.withLock { breakdowns[path] = breakdown } }
 
         func store(owner: String?, at path: String) { lock.withLock { owners[path] = owner } }
+        func worktree(_ path: String) -> WorktreeUsage? { lock.withLock { worktrees[path] } }
+        func size(_ path: String) -> UInt64? { lock.withLock { sizes[path] } }
+        func breakdown(_ path: String) -> [String: UInt64]? { lock.withLock { breakdowns[path] } }
         func store(worktree usage: WorktreeUsage, at path: String) { lock.withLock { worktrees[path] = usage } }
         func store(size: UInt64, at path: String) { lock.withLock { sizes[path] = size } }
         func finishOne() -> Int { lock.withLock { finished += 1; return finished } }
+        /// Counts a job as done and returns the weight done so far
+        func finish(weight: Int) -> Int { lock.withLock { weightDone += weight; return weightDone } }
+        /// nil: not decided yet; .some(nil): no thread made it; .some(id): the thread that did
+        func decision(_ path: String) -> String?? { lock.withLock { owners[path] } }
     }
 
-    static func scan(progress: @escaping (String) -> Void) -> DiskReport {
+    /// Scans the disk. `progress` gets what is going on, `fraction` how much of the measuring is done, and `partial`
+    /// a report of what has been measured so far, about once a second, so that results can be shown as they arrive.
+    static func scan(progress: @escaping (String) -> Void, fraction: ((Double) -> Void)? = nil,
+                     partial: ((DiskReport) -> Void)? = nil) -> DiskReport {
         let started = Date()
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
@@ -104,11 +122,12 @@ enum DiskScanner {
                 claim("\(repo)/.claude/worktrees/\(agent)", transcript.sessionId, transcript.modified)
             }
         }
-        var orphanRoots: [String] = []
+        // Worktrees no session has as its working directory; which session made each is worked out below
+        var claudeUnmatched: [String] = []
         for repo in repos {
             for name in (try? fm.contentsOfDirectory(atPath: repo + "/.claude/worktrees")) ?? [] {
                 let root = "\(repo)/.claude/worktrees/\(name)"
-                if claudeOwner[root] == nil, isDirectory(root) { orphanRoots.append(root) }
+                if claudeOwner[root] == nil, isDirectory(root) { claudeUnmatched.append(root) }
             }
         }
 
@@ -134,49 +153,42 @@ enum DiskScanner {
                 if codexOwner[root] == nil, fm.fileExists(atPath: root + "/.git") { unmatched.append(root) }
             }
         }
-        progress("Matching worktrees to threads…")
-        let creators = Results()
-        let matchQueue = OperationQueue()
-        matchQueue.maxConcurrentOperationCount = 4
-        matchQueue.qualityOfService = .utility
-        for root in unmatched {
-            matchQueue.addOperation { creators.store(owner: creator(of: root, among: threads), at: root) }
-        }
-        matchQueue.waitUntilAllOperationsAreFinished()
-        for root in unmatched {
-            if let id = creators.owners[root] ?? nil { codexOwner[root] = id } else { orphanRoots.append(root) }
-        }
-
-        // Measure everything, heaviest jobs first, a few at a time so the disk is not saturated
+        // Measure everything a few jobs at a time so the disk is not saturated. The quick jobs go first, so that
+        // there is something to show early.
+        // Worktrees an agent made by hand are in no thread's `cwd`; which thread made one is worked out in the same
+        // queue, and the worktree shows up under that thread once it is known
         let results = Results()
-        var jobs: [() -> Void] = []
-        for root in Set(claudeOwner.keys).union(codexOwner.keys).union(orphanRoots) {
-            jobs.append { results.store(worktree: analyze(root), at: root) }
+        let creators = Results()
+        var jobs: [(weight: Int, run: () -> Void)] = []
+        for root in unmatched {
+            jobs.append((weight: 4, run: { creators.store(owner: creator(of: root, among: threads), at: root) }))
         }
-        for path in scratch.values.joined() { jobs.append { results.store(size: DiskSize.of(path), at: path) } }
+        for root in claudeUnmatched {
+            jobs.append((weight: 4, run: {
+                creators.store(owner: ClaudeSessions.creator(of: root, among: transcripts)?.sessionId, at: root)
+            }))
+        }
         for transcript in transcripts {
-            jobs.append { results.store(size: DiskSize.of(transcript.directory), at: transcript.directory) }
+            jobs.append((weight: 1, run: { results.store(size: DiskSize.of(transcript.directory), at: transcript.directory) }))
         }
-        let total = jobs.count
-        let queue = OperationQueue()
-        queue.maxConcurrentOperationCount = 4
-        queue.qualityOfService = .utility
-        for job in jobs {
-            queue.addOperation {
-                job()
-                let done = results.finishOne()
-                if done % 8 == 0 || done == total { progress("Measuring \(done) of \(total)…") }
-            }
+        for path in scratch.values.joined() {
+            jobs.append((weight: 1, run: {
+                let m = DiskSize.measure(path, buckets: 1, breakdown: true) { _, _ in nil }
+                results.store(size: m.buckets[0], at: path)
+                results.store(breakdown: m.topLevel, at: path)
+            }))
         }
-        queue.waitUntilAllOperationsAreFinished()
-        progress("Preparing the list…")
+        // A worktree takes much longer than a scratch directory, so it counts for more in the progress bar
+        for root in Set(claudeOwner.keys).union(codexOwner.keys).union(unmatched).union(claudeUnmatched) {
+            jobs.append((weight: 15, run: { results.store(worktree: analyze(root), at: root) }))
+        }
 
         func busyProcess(in path: String) -> Int32? {
             processDirectories.first { $0.path == path || $0.path.hasPrefix(path + "/") }?.pid
         }
 
         func worktreeItems(root: String, running: Bool, owner: DiskOwner) -> [DiskItem] {
-            guard let usage = results.worktrees[root] else { return [] }
+            guard let usage = results.worktree(root) else { return [] }
             let subject = root.contains("/.codex/")
                 ? root.split(separator: "/").suffix(2).joined(separator: "/") : (root as NSString).lastPathComponent
             var blocker: String?
@@ -192,13 +204,13 @@ enum DiskScanner {
                     cleanable: blocker == nil,
                     note: blocker ?? "\(usage.dependencyNames.prefix(3).joined(separator: ", ")): can be reinstalled or rebuilt",
                     removal: .ignoredDirectories(root: root, paths: usage.dependencyPaths.map { root + "/" + $0 }),
-                    owner: owner))
+                    owner: owner, entries: entries(root, usage.dependencyEntries)))
             }
             if usage.ignored > 0 {
                 items.append(DiskItem(
                     id: root + "#ignored", kind: .ignored, subject: subject, path: root, bytes: usage.ignored, cleanable: false,
                     note: "\(usage.ignoredNames.prefix(3).joined(separator: ", ")): ignored by git, so it is lost if the worktree is removed",
-                    owner: owner))
+                    owner: owner, entries: entries(root, usage.ignoredEntries)))
             }
             let reason: String?
             if let blocker { reason = blocker }
@@ -211,8 +223,12 @@ enum DiskScanner {
             items.append(DiskItem(
                 id: root + "#files", kind: .worktree, subject: subject, path: root, bytes: usage.files, cleanable: reason == nil,
                 note: reason ?? "No uncommitted changes and every commit is on a remote branch: the whole worktree can be removed",
-                removal: .worktree(root: root), owner: owner))
+                removal: .worktree(root: root), owner: owner, entries: entries(root, usage.fileEntries)))
             return items
+        }
+
+        func entries(_ base: String, _ list: [(name: String, bytes: UInt64)]) -> [DiskEntry] {
+            list.prefix(120).map { DiskEntry(path: base + "/" + $0.name, name: $0.name, bytes: $0.bytes) }
         }
 
         func runningNote(_ owner: DiskOwner) -> String {
@@ -222,96 +238,145 @@ enum DiskScanner {
 
         func scratchItems(sessionId: String, running: Bool) -> [DiskItem] {
             (scratch[sessionId] ?? []).compactMap { path in
-                guard let bytes = results.sizes[path], bytes > 0 else { return nil }
+                guard let bytes = results.size(path), bytes > 0 else { return nil }
                 let blocker = running ? "The session is running"
                     : busyProcess(in: path).map { "\(Procs.read($0)?.name ?? "A process") (pid \($0)) is running in this directory" }
                 return DiskItem(id: path, kind: .scratch, path: path, bytes: bytes, cleanable: blocker == nil,
                                 note: blocker ?? "Temporary working files of the session", removal: .directory(path),
-                                owner: .claude(sessionId))
+                                owner: .claude(sessionId),
+                                entries: (results.breakdown(path) ?? [:]).sorted { $0.value > $1.value }.prefix(120)
+                                    .map { DiskEntry(path: path + "/" + $0.key, name: $0.key, bytes: $0.value) })
             }
         }
 
-        func ago(_ date: Date) -> String {
-            let formatter = RelativeDateTimeFormatter()
-            formatter.locale = Locale(identifier: "en_US")
-            formatter.unitsStyle = .short
-            return formatter.localizedString(for: date, relativeTo: Date())
+        let formatter = RelativeDateTimeFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.unitsStyle = .short
+        func ago(_ date: Date) -> String { formatter.localizedString(for: date, relativeTo: Date()) }
+
+        // Titles of ended sessions are read from their transcripts; once is enough
+        var titles: [String: String?] = [:]
+        func endedTitle(_ id: String) -> String? {
+            if let known = titles[id] { return known }
+            let title = ClaudeSessions.title(ofEndedSession: id)
+            titles[id] = .some(title)
+            return title
         }
 
-        var sessions: [DiskSession] = []
-        var knownScratch = Set<String>()
+        /// Everything measured so far as a report: parts appear as their measurements finish
+        func assemble() -> DiskReport {
+            var codexNow = codexOwner
+            var claudeNow = claudeOwner
+            var orphans: [String] = []
+            for root in claudeUnmatched {
+                switch creators.decision(root) {
+                case .some(.some(let id)): claudeNow[root] = (id, Date())
+                case .some(.none): orphans.append(root)
+                case .none: break  // not worked out yet
+                }
+            }
+            for root in unmatched {
+                switch creators.decision(root) {
+                case .some(.some(let id)): codexNow[root] = id
+                case .some(.none): orphans.append(root)
+                case .none: break  // not worked out yet
+                }
+            }
+            var sessions: [DiskSession] = []
+            var knownScratch = Set<String>()
 
-        for transcript in transcripts {
-            knownScratch.insert(transcript.sessionId)
-            let live = liveById[transcript.sessionId]
-            let running = live != nil
-            var items = [DiskItem(
-                id: transcript.file, kind: .history, path: transcript.file,
-                bytes: transcript.fileBytes + (results.sizes[transcript.directory] ?? 0), cleanable: false,
-                note: "The conversation; needed to resume the session")]
-            items += scratchItems(sessionId: transcript.sessionId, running: running)
-            for (root, owner) in claudeOwner where owner.id == transcript.sessionId {
-                items += worktreeItems(root: root, running: running, owner: .claude(transcript.sessionId))
+            for transcript in transcripts {
+                knownScratch.insert(transcript.sessionId)
+                let live = liveById[transcript.sessionId]
+                let running = live != nil
+                var items = [DiskItem(
+                    id: transcript.file, kind: .history, path: transcript.file,
+                    bytes: transcript.fileBytes + (results.size(transcript.directory) ?? 0), cleanable: false,
+                    note: "The conversation; needed to resume the session")]
+                items += scratchItems(sessionId: transcript.sessionId, running: running)
+                for (root, owner) in claudeNow where owner.id == transcript.sessionId {
+                    items += worktreeItems(root: root, running: running, owner: .claude(transcript.sessionId))
+                }
+                let session = DiskSession(
+                    id: "claude-\(transcript.sessionId)", source: .claude,
+                    title: live.map { $0.name.isEmpty ? ($0.cwd as NSString).lastPathComponent : $0.name }
+                        ?? (items.count > 1 ? endedTitle(transcript.sessionId) : nil)
+                        ?? "Session \(transcript.sessionId.prefix(8))",
+                    detail: [transcript.cwd.map(Collector.shortPath), running ? "Running" : "Ended",
+                             running ? nil : "last active " + ago(transcript.modified)].compactMap { $0 }.joined(separator: " · "),
+                    items: items)
+                sessions.append(session)
             }
-            let session = DiskSession(
-                id: "claude-\(transcript.sessionId)", source: .claude,
-                title: live.map { $0.name.isEmpty ? ($0.cwd as NSString).lastPathComponent : $0.name }
-                    ?? (items.count > 1 ? ClaudeSessions.title(ofEndedSession: transcript.sessionId) : nil)
-                    ?? "Session \(transcript.sessionId.prefix(8))",
-                detail: [transcript.cwd.map(Collector.shortPath), running ? "Running" : "Ended",
-                         running ? nil : "last active " + ago(transcript.modified)].compactMap { $0 }.joined(separator: " · "),
-                items: items)
-            sessions.append(session)
-        }
 
-        for thread in threads {
-            let active = Date().timeIntervalSince(thread.updatedAt) < codexActiveWindow
-            let rollout = (try? URL(fileURLWithPath: thread.rolloutPath).resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
-                .totalFileAllocatedSize ?? 0
-            var items: [DiskItem] = []
-            if rollout > 0 {
-                items.append(DiskItem(id: thread.rolloutPath, kind: .history, path: thread.rolloutPath,
-                                      bytes: UInt64(rollout), cleanable: false,
-                                      note: "The conversation log; needed to reopen the thread"))
-            }
-            for (root, owner) in codexOwner where owner == thread.id {
-                items += worktreeItems(root: root, running: active, owner: .codex(thread.id))
-            }
-            sessions.append(DiskSession(
-                id: "codex-\(thread.id)", source: .codex, title: thread.displayTitle,
-                detail: [thread.subAgentLabel, Collector.shortPath(thread.cwd),
-                         thread.isArchived ? "Archived" : active ? "Active" : "Idle",
-                         "last active " + ago(thread.updatedAt)].compactMap { $0 }.joined(separator: " · "),
-                items: items))
-        }
-
-        // Scratch files whose transcript is gone, and worktrees no session claims
-        for (id, paths) in scratch where !knownScratch.contains(id) {
-            let items = scratchItems(sessionId: id, running: liveById[id] != nil)
-            if !items.isEmpty {
-                sessions.append(DiskSession(id: "claude-\(id)", source: .claude, title: "Session \(id.prefix(8))",
-                                            detail: "Transcript not found · " + Collector.shortPath(paths[0]), items: items))
-            }
-        }
-        for root in orphanRoots {
-            let items = worktreeItems(root: root, running: false, owner: .nobody)
-            if !items.isEmpty {
+            for thread in threads {
+                let active = Date().timeIntervalSince(thread.updatedAt) < codexActiveWindow
+                let rollout = (try? URL(fileURLWithPath: thread.rolloutPath).resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?
+                    .totalFileAllocatedSize ?? 0
+                var items: [DiskItem] = []
+                if rollout > 0 {
+                    items.append(DiskItem(id: thread.rolloutPath, kind: .history, path: thread.rolloutPath,
+                                          bytes: UInt64(rollout), cleanable: false,
+                                          note: "The conversation log; needed to reopen the thread"))
+                }
+                for (root, owner) in codexNow where owner == thread.id {
+                    items += worktreeItems(root: root, running: active, owner: .codex(thread.id))
+                }
                 sessions.append(DiskSession(
-                    id: "worktree-\(root)", source: root.contains("/.codex/") ? .codex : .claude,
-                    title: root.contains("/.codex/") ? String(root.split(separator: "/").suffix(2).first ?? "")
-                                                     : (root as NSString).lastPathComponent,
-                    detail: [Collector.shortPath(root), results.worktrees[root]?.git?.branch.nilIfEmpty.map { "branch \($0)" },
-                             "No session found"].compactMap { $0 }.joined(separator: " · "),
+                    id: "codex-\(thread.id)", source: .codex, title: thread.displayTitle,
+                    detail: [thread.subAgentLabel, Collector.shortPath(thread.cwd),
+                             thread.isArchived ? "Archived" : active ? "Active" : "Idle",
+                             "last active " + ago(thread.updatedAt)].compactMap { $0 }.joined(separator: " · "),
                     items: items))
             }
+
+            // Scratch files whose transcript is gone, and worktrees no session claims
+            for (id, paths) in scratch where !knownScratch.contains(id) {
+                let items = scratchItems(sessionId: id, running: liveById[id] != nil)
+                if !items.isEmpty {
+                    sessions.append(DiskSession(id: "claude-\(id)", source: .claude, title: "Session \(id.prefix(8))",
+                                                detail: "Transcript not found · " + Collector.shortPath(paths[0]), items: items))
+                }
+            }
+            for root in orphans {
+                let items = worktreeItems(root: root, running: false, owner: .nobody)
+                if !items.isEmpty {
+                    sessions.append(DiskSession(
+                        id: "worktree-\(root)", source: root.contains("/.codex/") ? .codex : .claude,
+                        title: root.contains("/.codex/") ? String(root.split(separator: "/").suffix(2).first ?? "")
+                                                         : (root as NSString).lastPathComponent,
+                        detail: [Collector.shortPath(root), results.worktree(root)?.git?.branch.nilIfEmpty.map { "branch \($0)" },
+                                 "No session found"].compactMap { $0 }.joined(separator: " · "),
+                        items: items))
+                }
+            }
+
+            let listed = sessions.filter { !$0.isHistoryOnly }
+                .sorted { ($0.reclaimable, $0.kept) > ($1.reclaimable, $1.kept) }
+            let historyOnly = sessions.filter(\.isHistoryOnly)
+            return DiskReport(
+                time: Date(), seconds: Date().timeIntervalSince(started), sessions: listed,
+                historyOnlyCount: historyOnly.count, historyOnlyBytes: historyOnly.reduce(0) { $0 + $1.kept })
         }
 
-        let listed = sessions.filter { !$0.isHistoryOnly }
-            .sorted { ($0.reclaimable, $0.kept) > ($1.reclaimable, $1.kept) }
-        let historyOnly = sessions.filter(\.isHistoryOnly)
-        return DiskReport(
-            time: Date(), seconds: Date().timeIntervalSince(started), sessions: listed,
-            historyOnlyCount: historyOnly.count, historyOnlyBytes: historyOnly.reduce(0) { $0 + $1.kept })
+        let total = jobs.reduce(0) { $0 + $1.weight }
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 4
+        queue.qualityOfService = .utility
+        let group = DispatchGroup()
+        let jobCount = jobs.count
+        for job in jobs {
+            group.enter()
+            queue.addOperation {
+                job.run()
+                let finished = results.finishOne()
+                if finished % 8 == 0 || finished == jobCount { progress("Measuring \(finished) of \(jobCount)…") }
+                fraction?(Double(results.finish(weight: job.weight)) / Double(total))
+                group.leave()
+            }
+        }
+        while group.wait(timeout: .now() + 1) == .timedOut { partial?(assemble()) }
+        progress("Preparing the list…")
+        return assemble()
     }
 
     /// The thread that created the worktree at `root`: among the threads that were running when the directory was
@@ -336,7 +401,7 @@ enum DiskScanner {
 
     private static func analyze(_ root: String) -> WorktreeUsage {
         let git = Git.state(of: root)
-        let measurement = DiskSize.measure(root, buckets: 3) { path, isDirectory in
+        let measurement = DiskSize.measure(root, buckets: 3, breakdown: true) { path, isDirectory in
             guard let git else { return nil }
             if isDirectory {
                 guard git.ignoredDirectories.contains(path) else { return nil }
@@ -349,11 +414,19 @@ enum DiskScanner {
             for entry in measurement.classified where entry.bucket == bucket { sizes[name(entry.path), default: 0] += entry.bytes }
             return sizes.sorted { $0.value > $1.value }.map(\.key)
         }
+        func sizes(_ bucket: Int, name: (String) -> String) -> [(name: String, bytes: UInt64)] {
+            var result: [String: UInt64] = [:]
+            for entry in measurement.classified where entry.bucket == bucket { result[name(entry.path), default: 0] += entry.bytes }
+            return result.sorted { $0.value > $1.value }.map { (name: $0.key, bytes: $0.value) }
+        }
         return WorktreeUsage(
             files: measurement.buckets[0], dependencies: measurement.buckets[1], ignored: measurement.buckets[2],
             dependencyNames: largest(1) { ($0 as NSString).lastPathComponent },
             ignoredNames: largest(2) { String($0.split(separator: "/").first ?? "") },
             dependencyPaths: measurement.classified.filter { $0.bucket == 1 }.map(\.path),
+            fileEntries: measurement.topLevel.sorted { $0.value > $1.value }.map { (name: $0.key, bytes: $0.value) },
+            dependencyEntries: sizes(1) { $0 },
+            ignoredEntries: sizes(2) { String($0.split(separator: "/").first ?? "") },
             git: git)
     }
 

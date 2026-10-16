@@ -18,8 +18,8 @@ group with the session's name.
 - End a session, its leftover processes or a single process, after a confirmation
 - **Clean Up** in one click: ends the processes of sessions that are over, keeping shared services such as Colima
 - Samples on demand: press **Refresh** (⌘R); nothing runs in the background between refreshes
-- A **Disk** tab shows what each session leaves on disk (scratch files, worktrees, dependencies), how much of it can
-  be deleted, and deletes it after a confirmation. Conversations are never deleted
+- A **Disk** tab shows what each session leaves on disk (scratch files, worktrees, dependencies) as a ring chart you
+  can click through, marks what can be deleted, and deletes it after a confirmation. Conversations are never deleted
 
 ## Requirements
 
@@ -58,12 +58,14 @@ The first matching rule wins:
    read from the session transcript.
 3. The Claude desktop app's `disclaimer` launcher belongs to the session it launched.
 4. Otherwise, walk up the parent process chain.
-5. Remaining processes of the Claude desktop app and the Codex / ChatGPT app are shown as the apps themselves;
+5. A detached process (parent 1) whose working directory is a Claude Code worktree, such as a supervisor that was
+   started with a cleared environment (`env -i`): the running session that works in that worktree, or else a group
+   named after the worktree.
+6. Remaining processes of the Claude desktop app and the Codex / ChatGPT app are shown as the apps themselves;
    everything else is listed as *Not attributed to any session*.
 
 Codex thread names and the parent of each sub-agent come from `~/.codex/state_5.sqlite`. Sub-agents have no title
-of their own, so they are shown under the task name their parent gave them (for example *research active schema
-detection*), with the generated nickname in the details.
+of their own, so they are shown under the task name their parent gave them (for example *review billing logic*), with the generated nickname in the details.
 
 Only the two session ID variables are taken from a process environment. Every other variable, including tokens,
 is skipped and never stored or displayed. Nothing leaves your machine.
@@ -112,12 +114,33 @@ The **Disk** tab lists every Claude Code session and Codex thread that occupies 
 splits each into parts. Press **Scan Disk** (⌘R): it reads every file under the folders below, which takes 30 to 60
 seconds, and runs only when you ask. Scanning changes nothing.
 
+### Reading the chart
+
+The chart and the list fill in while the scan runs, so there is something to look at after a couple of seconds; collecting
+and deleting wait until it is done. The strip between the chart and the list can be dragged to give the list more or
+less room.
+
+The chart works like a disk analyzer. Its slices glide between views instead of jumping: opening a slice makes it expand
+into the middle, going back lets the middle grow out into a ring again, slices swell as a scan fills in, and the one
+under the pointer lifts a little. (With *Reduce motion* turned on in System Settings, they jump.) The middle names what you are looking at and its size; the rings around it show
+what is inside, from the inside out: sessions, their parts, the folders in each part, and folders below those.
+
+- **Bright slices can be deleted, dim ones are kept.** The same colours mark the dots in the list on the right.
+- **Hover** a slice or a row to see it named in the middle; the other side lights up too.
+- **Click** a slice or a row to look inside it, or the middle to go back up. The bar at the top shows where you are,
+  each step can be clicked, and ‹ › (⌘[ and ⌘]) go back and forward. Folders deeper than the scan recorded are
+  measured when you open them.
+- **Drag** a slice or a row into the tray at the bottom, or right-click and choose *Add to Collection*, to collect it;
+  *Add all* collects everything that can be deleted. The tray shows what each collected item would free.
+- **Delete** in the tray (⌘⌫) asks for confirmation first. Only sessions and whole parts can be collected, not the
+  folders inside them.
+
 | Part | Where it lives | Counted as deletable |
 |---|---|---|
 | Scratch files | `/tmp/claude-<uid>/<project>/<session id>/` | Always, once the session is not running |
 | Dependencies and caches | Git-ignored `node_modules`, `.venv`, `__pycache__`, `dist`, `build`, `target`, `.terraform` and the like inside a worktree | Always, once the session is not running |
 | Worktree files | `<repo>/.claude/worktrees/<name>` (Claude Code, including those sub-agents create) or `~/.codex/worktrees/<hash>/<repo>` (Codex) | Only if git reports no uncommitted changes, every commit is on some remote branch, and the worktree holds no other git-ignored files, which would be lost with it |
-| Ignored files | Git-ignored files in a worktree that are not known to be rebuildable, such as a `.memo/` folder | Never |
+| Ignored files | Git-ignored files in a worktree that are not known to be rebuildable, such as a folder of local results | Never |
 | Conversation history | `~/.claude/projects/.../<id>.jsonl` and its folder, `~/.codex/sessions/.../rollout-*.jsonl` | Never: deleting it loses the ability to resume |
 
 A part is held back, with the reason shown, while its session is running (a Codex thread counts as running if it
@@ -125,17 +148,21 @@ was active in the last hour) or while any process has its working directory insi
 allocated on disk, as `du` reports; hard-linked files count once.
 
 A worktree shared by several sessions (a resumed conversation, or the sub-agents of a Codex thread) is shown under
-the one that was active last. Codex agents often create worktrees by hand (`git worktree add
-~/.codex/worktrees/<name>/<repo>`), which no thread records as its working directory. Those are matched to the
-earliest thread that was running when the directory was created and whose conversation log mentions it, which is
-usually the thread that made it. Worktrees that still cannot be matched are listed under their directory name with
-*No session found*.
+the one that was active last.
+
+Some worktrees are nobody's working directory: Codex agents create them by hand (`git worktree add
+~/.codex/worktrees/<name>/<repo>`), and Claude Code sessions sometimes make one for work they run from elsewhere.
+Those are matched to the session that made them: among the sessions that were running when the directory was
+created, the one whose conversation mentions its path first (a session that only listed the worktrees later does not
+count). A Claude Code session's sub-agents are included in that search. The process list does the same to say which
+session made a worktree that holds detached processes. Worktrees that still cannot be matched are listed under
+their directory name with *No session found*.
+
+Names can be selected in the panel's header, and *Copy Name* is in the right-click menu of every slice and row.
 
 ### Deleting
 
-Select a session or one of its parts and press **Delete…** (⌘⌫), right-click it, or use **Delete All** for everything
-marked deletable. A dialog lists what will be removed and its size. Deleting is permanent and never touches
-conversations.
+A dialog lists what will be removed and its size. Deleting is permanent and never touches conversations.
 
 - Scratch files and dependency directories are deleted from disk.
 - A worktree is removed with `git worktree remove`; its branch and commits stay.

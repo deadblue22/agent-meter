@@ -16,15 +16,20 @@ struct RootView: View {
 
     @State private var mode = Mode.processes
     @State private var report: Report?
-    @State private var diskScan = DiskScan()
+    @StateObject private var disk = DiskExplorer()
 
     var body: some View {
-        Group {
+        ZStack {
+            Theme.background.ignoresSafeArea()
             switch mode {
             case .processes: ContentView(report: $report)
-            case .disk: DiskView(scan: $diskScan)
+            case .disk: DiskView(disk: disk)
             }
         }
+        .preferredColorScheme(.dark)
+        .tint(Theme.accentStrong)
+        .background(WindowStyler())
+        .toolbarBackground(.hidden, for: .windowToolbar)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 Picker("View", selection: $mode) {
