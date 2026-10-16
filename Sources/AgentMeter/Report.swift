@@ -104,6 +104,8 @@ enum Collector {
 
         let claudeSessions = ClaudeSessions.running().filter { processes[$0.key] != nil }
         let sessionIdByPid = claudeSessions.mapValues(\.sessionId)
+        // Processes started by an earlier session of a conversation that goes on belong to the session that continues it
+        let predecessor = ClaudeSessions.predecessors(among: claudeSessions)
 
         func executable(_ pid: Int32) -> String { arguments[pid]?.first ?? processes[pid]?.name ?? "" }
 
@@ -143,7 +145,7 @@ enum Collector {
             if let sessionId = sessionIdByPid[pid] {
                 result = .claude(sessionId)
             } else if let sessionId = env[claudeSessionKey] {
-                result = .claude(sessionId)
+                result = .claude(predecessor[sessionId] ?? sessionId)
             } else if let threadId = env[codexThreadKey] {
                 result = .codex(threadId)
             } else if process.name == "disclaimer",
@@ -301,6 +303,10 @@ enum Collector {
     private static func displayName(pid: Int32, process: RawProcess, arguments: [String]?, isSession: Bool) -> String {
         if isSession { return "Claude Code session process" }
         if process.name == "disclaimer" { return "disclaimer (desktop launcher)" }
+        // Chrome and the apps built on Chromium run many helper processes; what each one is for is in its flags
+        if let arguments, let role = Chromium.role(arguments) {
+            return [Chromium.appName(arguments.first ?? ""), role].compactMap { $0 }.joined(separator: " · ")
+        }
         let base = arguments?.first.map { ($0 as NSString).lastPathComponent } ?? ""
         return base.isEmpty ? process.name : base
     }

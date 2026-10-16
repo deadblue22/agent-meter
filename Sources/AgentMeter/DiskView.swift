@@ -364,7 +364,7 @@ struct DiskView: View {
                 }
             }
             .font(.caption)
-            Text("Kept: running sessions, worktrees with changes or ignored files, and conversations, which are never deleted. Deleting is permanent; every part is checked again right before it goes.")
+            Text("Kept by default: running sessions, worktrees with changes or with files git ignores, and conversations, which are never deleted. Files git ignores can be collected on their own if you decide they are not needed. Deleting is permanent; every part is checked again right before it goes.")
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.45))
                 .fixedSize(horizontal: false, vertical: true)
@@ -422,6 +422,10 @@ struct DiskView: View {
 
     private func chip(_ node: DiskNode, removable: Bool) -> some View {
         HStack(spacing: 6) {
+            if node.item?.needsConsent == true {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    .help("Files git ignores: they exist only on this Mac")
+            }
             Text(node.name).lineLimit(1).truncationMode(.middle).frame(maxWidth: 190)
             Text(Format.bytes(disk.freed(by: node))).foregroundStyle(.white.opacity(0.6)).monospacedDigit()
             if removable {
@@ -450,6 +454,13 @@ struct DiskView: View {
             if let path = node.path {
                 Button("Reveal in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)]) }
                 Button("Copy Path") { copy(path) }
+            }
+            if let consent = disk.consentPlan(for: id) {
+                Divider()
+                Button("Delete Ignored Files (\(Format.bytes(consent.bytes)))…", role: .destructive) { pending = consent }
+            } else if let reason = disk.ignoredBlocker(for: id) {
+                Divider()
+                Button("Delete Ignored Files… (\(reason))") {}.disabled(true)
             }
             if node.kind == .session || node.kind == .part {
                 Divider()

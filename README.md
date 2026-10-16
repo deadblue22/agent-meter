@@ -64,6 +64,16 @@ The first matching rule wins:
 6. Remaining processes of the Claude desktop app and the Codex / ChatGPT app are shown as the apps themselves;
    everything else is listed as *Not attributed to any session*.
 
+A conversation that goes on under a new session ID (resumed, or continued after the old session ran out of room) is a
+new session in Claude Code's registry. Agent Meter reads `--resume=<id>` from the running session's arguments and
+treats the earlier session as the same conversation: its leftover processes, and in the Disk tab its transcript,
+scratch files and worktrees, are shown with the session that continues it, not as a second, ended one. Its files
+are not offered for deletion while the conversation is running, because the conversation still refers to them.
+
+Chrome and apps built on Chromium (Lark, Claude, ChatGPT) run many helper processes. Those are labelled by what they
+are for, read from their flags: *Page renderer*, *Extension renderer*, *GPU*, *Network service*, *Storage service*
+and so on. Which page a renderer shows is not in its command line, so tabs cannot be told apart from outside.
+
 Codex thread names and the parent of each sub-agent come from `~/.codex/state_5.sqlite`. Sub-agents have no title
 of their own, so they are shown under the task name their parent gave them (for example *review billing logic*), with the generated nickname in the details.
 
@@ -131,16 +141,17 @@ what is inside, from the inside out: sessions, their parts, the folders in each 
   each step can be clicked, and ‹ › (⌘[ and ⌘]) go back and forward. Folders deeper than the scan recorded are
   measured when you open them.
 - **Drag** a slice or a row into the tray at the bottom, or right-click and choose *Add to Collection*, to collect it;
-  *Add all* collects everything that can be deleted. The tray shows what each collected item would free.
+  *Add all* collects everything that can be deleted, and never includes git-ignored files that are not disposable;
+  those can only be collected on their own, and the tray marks them with a warning. The tray shows what each collected item would free.
 - **Delete** in the tray (⌘⌫) asks for confirmation first. Only sessions and whole parts can be collected, not the
   folders inside them.
 
 | Part | Where it lives | Counted as deletable |
 |---|---|---|
 | Scratch files | `/tmp/claude-<uid>/<project>/<session id>/` | Always, once the session is not running |
-| Dependencies and caches | Git-ignored `node_modules`, `.venv`, `__pycache__`, `dist`, `build`, `target`, `.terraform` and the like inside a worktree | Always, once the session is not running |
-| Worktree files | `<repo>/.claude/worktrees/<name>` (Claude Code, including those sub-agents create) or `~/.codex/worktrees/<hash>/<repo>` (Codex) | Only if git reports no uncommitted changes, every commit is on some remote branch, and the worktree holds no other git-ignored files, which would be lost with it |
-| Ignored files | Git-ignored files in a worktree that are not known to be rebuildable, such as a folder of local results | Never |
+| Dependencies and caches | Git-ignored `node_modules`, `.venv`, `__pycache__`, `dist`, `build`, `target`, `.terraform`, `dbt_packages`, logs and local tool settings such as `.claude/` or `.user.yml` inside a worktree | Always, once the session is not running |
+| Worktree files | `<repo>/.claude/worktrees/<name>` (Claude Code, including those sub-agents create) or `~/.codex/worktrees/<hash>/<repo>` (Codex) | Only if git reports no uncommitted changes, every commit is on some remote branch, and the worktree holds no git-ignored files besides the disposable ones above, since those would be lost with it |
+| Ignored files | Any other git-ignored file or folder in a worktree, such as notes or copies of code kept for analysis | Not by default. They exist only on this Mac, so it is your call: collect the part yourself, or right-click a part or a whole session and choose *Delete Ignored Files…*, which deletes all the ignored files of that session's worktrees at once. The confirmation names what is in it. Greyed out, with the reason, while the session is running or a process is working in the worktree |
 | Conversation history | `~/.claude/projects/.../<id>.jsonl` and its folder, `~/.codex/sessions/.../rollout-*.jsonl` | Never: deleting it loses the ability to resume |
 
 A part is held back, with the reason shown, while its session is running (a Codex thread counts as running if it

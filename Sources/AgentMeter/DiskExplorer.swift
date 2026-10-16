@@ -5,6 +5,8 @@ struct DeletePlan: Identifiable {
     let id = UUID()
     let title: String
     let items: [DiskItem]
+    /// The user chose to delete git-ignored files that are not known to be disposable
+    var consent = false
 
     var bytes: UInt64 { items.reduce(0) { $0 + $1.bytes } }
 
@@ -15,7 +17,21 @@ struct DeletePlan: Identifiable {
         }
         let parts = [line("Scratch files", .scratch), line("Dependencies and caches", .dependencies),
                      line("Worktree files, whole worktrees removed", .worktree)].compactMap { $0 }
-        return parts.joined(separator: "\n")
+        let ignored = items.filter(\.needsConsent)
+        var warning = ""
+        if !ignored.isEmpty {
+            // The same name turns up in many worktrees; add them up
+            var sizes: [String: UInt64] = [:]
+            for entry in ignored.flatMap(\.entries) { sizes[entry.name, default: 0] += entry.bytes }
+            let names = sizes.sorted { $0.value > $1.value }.prefix(6).map { "\($0.key) (\(Format.bytes($0.value)))" }.joined(separator: ", ")
+            let places = Set(ignored.map(\.path)).count
+            warning = "\n\nYou chose to delete files that git ignores, so they exist only on this Mac"
+                + (places > 1 ? ", in \(places) worktrees" : "") + ": \(names). Nothing else restores them."
+        }
+        if consent, parts.isEmpty {
+            return warning.trimmingCharacters(in: .whitespacesAndNewlines) + " This cannot be undone. Each one is checked again just before it is deleted."
+        }
+        return parts.joined(separator: "\n") + warning
             + "\n\nConversations are never deleted. Worktrees are removed with git worktree remove; their branches and commits stay. "
             + "Each part is checked again just before it is deleted and skipped if it is no longer safe. This cannot be undone."
     }
@@ -208,7 +224,8 @@ final class DiskExplorer: ObservableObject {
         case .session, .part:
             if plan(for: [id]) == nil {
                 notice = node.kind == .session ? "Nothing in “\(node.name)” can be deleted now. Open it to see why."
-                    : node.item?.kind == .history ? "Conversations are never deleted." : "Not deletable: \(node.detail)"
+                    : node.item?.kind == .history ? "Conversations are never deleted."
+                    : "Not deletable: \(node.detail)"
                 return
             }
         case .others:
@@ -221,9 +238,11 @@ final class DiskExplorer: ObservableObject {
             return
         }
         notice = nil
-        // A session in the tray covers its parts; a part is skipped if its session is already there
-        collected.removeAll { other in node.children.contains { $0.id == other } }
-        if !collected.contains(where: { self.node($0)?.children.contains { $0.id == id } == true }) {
+        // A session in the tray covers its deletable parts, but not git-ignored files, which are only ever collected
+        // on their own
+        let chosen = node.item?.needsConsent == true
+        collected.removeAll { other in node.children.contains { $0.id == other && $0.item?.needsConsent != true } }
+        if chosen || !collected.contains(where: { self.node($0)?.children.contains { $0.id == id } == true }) {
             collected.append(id)
         }
     }
@@ -236,6 +255,30 @@ final class DiskExplorer: ObservableObject {
         collected = tree.children.filter { ($0.kind == .session || $0.id == "others-sessions") && $0.deletableBytes > 0 }.map(\.id)
     }
 
+    /// The git-ignored files of a part, a session, or the sessions too small to be listed, which are kept unless the
+    /// user says otherwise
+    private func ignoredItems(of node: DiskNode) -> [DiskItem] {
+        items(of: node).filter(\.needsConsent)
+    }
+
+    /// A plan to delete the git-ignored files of a part or of everything a session has, leaving out what cannot be
+    /// deleted right now
+    func consentPlan(for id: String) -> DeletePlan? {
+        guard let node = node(id), node.kind == .part || node.kind == .session || node.id == "others-sessions" else { return nil }
+        let items = ignoredItems(of: node).filter { $0.blocker == nil }
+        guard !items.isEmpty else { return nil }
+        let bytes = Format.bytes(items.reduce(0) { $0 + $1.bytes })
+        return DeletePlan(title: "Delete \(bytes) of ignored files from “\(node.name)”?", items: items, consent: true)
+    }
+
+    /// Why the ignored files of a session or part cannot be deleted now, when there are some but all are held back
+    func ignoredBlocker(for id: String) -> String? {
+        guard let node = node(id), node.kind == .part || node.kind == .session || node.id == "others-sessions" else { return nil }
+        let items = ignoredItems(of: node)
+        guard !items.isEmpty, items.allSatisfy({ $0.blocker != nil }) else { return nil }
+        return items.first?.blocker
+    }
+
     var collectedPlan: DeletePlan? { plan(for: collected) }
 
     /// Everything that can be deleted, including sessions too small to be listed
@@ -244,14 +287,17 @@ final class DiskExplorer: ObservableObject {
         return plan(items: report.sessions.flatMap(\.items))
     }
 
-    /// The deletable parts of the given sessions and parts
+    /// The deletable parts of the given sessions and parts. Git-ignored files are included only when their part is
+    /// picked by itself: choosing a session, or everything, never takes them along.
     func plan(for ids: [String]) -> DeletePlan? {
-        plan(items: ids.compactMap { node($0) }.flatMap(items(of:)))
+        let nodes = ids.compactMap { node($0) }
+        let byChoice = nodes.compactMap(\.item).filter(\.needsConsent)
+        return plan(items: nodes.flatMap(items(of:)), chosen: byChoice)
     }
 
-    private func plan(items all: [DiskItem]) -> DeletePlan? {
+    private func plan(items all: [DiskItem], chosen: [DiskItem] = []) -> DeletePlan? {
         guard let report else { return nil }
-        var picked = all.filter { $0.cleanable && $0.removal != nil }
+        var picked = all.filter { $0.cleanable && $0.removal != nil } + chosen
         // A removed worktree takes its dependencies with it
         let trees = Set(picked.filter(\.removesWorktree).map(\.path))
         picked += report.sessions.flatMap(\.items).filter { $0.kind == .dependencies && $0.cleanable && trees.contains($0.path) }
@@ -262,18 +308,21 @@ final class DiskExplorer: ObservableObject {
         let sessions = report.sessions.filter { $0.items.contains { ids.contains($0.id) } }
         let bytes = Format.bytes(picked.reduce(0) { $0 + $1.bytes })
         let title = sessions.count == 1 ? "Delete \(bytes) from “\(sessions[0].title)”?" : "Delete \(bytes) from \(sessions.count) sessions?"
-        return DeletePlan(title: title, items: picked)
+        return DeletePlan(title: title, items: picked, consent: picked.contains(where: \.needsConsent))
     }
 
     func delete(_ plan: DeletePlan) async {
         running = true
         notice = nil
         progress = "Deleting…"
-        let items = plan.items
+        let items = plan.items, consent = plan.consent
         let outcome = await Task.detached(priority: .utility) {
-            DiskCleaner.delete(items) { text in Task { @MainActor in self.progress = text } }
+            DiskCleaner.delete(items, consent: consent) { text in Task { @MainActor in self.progress = text } }
         }.value
         apply(outcome)
+        if plan.consent, !outcome.deleted.isEmpty {
+            notice = (notice ?? "") + ". Rescan to see whether the worktree itself can now be removed."
+        }
         running = false
     }
 

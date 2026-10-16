@@ -1,7 +1,8 @@
 import Darwin
 import Foundation
 
-/// Deletes the parts of sessions that the Disk tab marks as deletable.
+/// Deletes the parts of sessions that the Disk tab marks as deletable, and, when the user explicitly consents, git-ignored
+/// files that are not known to be disposable.
 ///
 /// A scan can be minutes old, so every part is checked again right before it is deleted and skipped if it is no
 /// longer safe: the session may be running again, a process may have started in it, a worktree may have gained
@@ -17,7 +18,7 @@ enum DiskCleaner {
         var freed: UInt64 { deleted.reduce(0) { $0 + $1.bytes } }
     }
 
-    static func delete(_ items: [DiskItem], progress: (String) -> Void) -> Outcome {
+    static func delete(_ items: [DiskItem], consent: Bool = false, progress: (String) -> Void) -> Outcome {
         var outcome = Outcome()
         let liveClaude = Set(ClaudeSessions.running().filter { Procs.read($0.key) != nil }.values.map(\.sessionId))
         let activeCodex = Set(CodexThreads.loadAll()
@@ -37,7 +38,9 @@ enum DiskCleaner {
             progress("Deleting \(index + 1) of \(ordered.count)…")
             func skip(_ reason: String) { outcome.skipped.append((item, reason)) }
 
-            guard let removal = item.removal, item.cleanable else { skip("Not deletable"); continue }
+            guard let removal = item.removal else { skip("Not deletable"); continue }
+            // Only parts marked deletable, or ignored files the user chose to delete anyway
+            if !item.cleanable, !(consent && item.needsConsent) { skip("Not deletable"); continue }
             switch item.owner {
             case .claude(let id) where liveClaude.contains(id): skip("The session is running again"); continue
             case .codex(let id) where activeCodex.contains(id): skip("The thread was active in the last hour"); continue
@@ -48,6 +51,7 @@ enum DiskCleaner {
             switch removal {
             case .directory(let path): location = path
             case .ignoredDirectories(let root, _): location = root
+            case .ignoredEntries(let root, _): location = root
             case .worktree(let root): location = root
             }
             if case .ignoredDirectories(let root, _) = removal, outcome.removedWorktrees.contains(root) {
@@ -71,10 +75,28 @@ enum DiskCleaner {
                 var failure: String?
                 for path in paths where exists(path) {
                     let name = (path as NSString).lastPathComponent
-                    guard path.hasPrefix(root + "/"), DiskScanner.dependencyNames.contains(name), isPlainDirectory(path) else {
-                        failure = "\(name) is not a plain dependency directory"
+                    guard path.hasPrefix(root + "/"), DiskScanner.dependencyNames.contains(name), isPlainEntry(path) else {
+                        failure = "\(name) is not a plain dependency folder or file"
                         break
                     }
+                    guard Git.isIgnored(String(path.dropFirst(root.count + 1)), in: root) else {
+                        failure = "\(name) is no longer ignored by git"
+                        break
+                    }
+                    if let error = remove(path) { failure = error; break }
+                }
+                if let failure { skip(failure) } else { outcome.deleted.append(item) }
+
+            case .ignoredEntries(let root, let paths):
+                guard isWorktree(root) else { skip("Not a worktree"); continue }
+                var failure: String?
+                for path in paths where exists(path) {
+                    let name = (path as NSString).lastPathComponent
+                    guard path.hasPrefix(root + "/"), isPlainEntry(path) else {
+                        failure = "\(name) is not a plain folder or file inside the worktree"
+                        break
+                    }
+                    // Whatever the scan saw, delete only what git still ignores, never a file it tracks
                     guard Git.isIgnored(String(path.dropFirst(root.count + 1)), in: root) else {
                         failure = "\(name) is no longer ignored by git"
                         break
@@ -122,6 +144,14 @@ enum DiskCleaner {
     private static func exists(_ path: String) -> Bool {
         var st = stat()
         return lstat(path, &st) == 0
+    }
+
+    /// A directory or a regular file, not a symbolic link
+    private static func isPlainEntry(_ path: String) -> Bool {
+        var st = stat()
+        guard lstat(path, &st) == 0 else { return false }
+        let kind = st.st_mode & mode_t(S_IFMT)
+        return kind == mode_t(S_IFDIR) || kind == mode_t(S_IFREG)
     }
 
     /// A directory that is not a symbolic link

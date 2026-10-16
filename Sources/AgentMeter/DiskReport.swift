@@ -15,6 +15,8 @@ enum DiskRemoval {
     case ignoredDirectories(root: String, paths: [String])
     /// Remove the whole worktree with `git worktree remove`
     case worktree(root: String)
+    /// Delete these git-ignored files and folders of a worktree, which only the user can say are not needed
+    case ignoredEntries(root: String, paths: [String])
 }
 
 /// A folder or file inside a part, to show where the space goes
@@ -54,6 +56,8 @@ struct DiskItem: Identifiable {
     /// Nil for conversations, which are never deleted
     var removal: DiskRemoval?
     var owner: DiskOwner = .nobody
+    /// What stands in the way of deleting it right now, if anything: the session is running, a process is working in it
+    var blocker: String?
     /// The largest folders and files inside, largest first
     var entries: [DiskEntry] = []
 
@@ -71,6 +75,9 @@ struct DiskItem: Identifiable {
 }
 
 extension DiskItem {
+    /// Not deletable by default, but the user can choose to delete it
+    var needsConsent: Bool { kind == .ignored && removal != nil && !cleanable }
+
     /// Deleting it removes the whole worktree, dependencies included
     var removesWorktree: Bool {
         if case .worktree = removal { return true }

@@ -40,6 +40,33 @@ enum ClaudeSessions {
         return result
     }
 
+    /// The session a `claude` process was started to resume: `--resume=<id>` or `--resume <id>`
+    static func resumeTarget(in arguments: [String]) -> String? {
+        for (index, argument) in arguments.enumerated() {
+            let value: String?
+            if argument.hasPrefix("--resume=") { value = String(argument.dropFirst("--resume=".count)) }
+            else if argument == "--resume", index + 1 < arguments.count { value = arguments[index + 1] }
+            else { continue }
+            if let value, UUID(uuidString: value) != nil { return value.lowercased() }
+        }
+        return nil
+    }
+
+    /// Conversations that go on under a new session ID: a session that was resumed, or continued after the old one
+    /// ran out of room, is a new session in Claude Code's registry, but it is the same conversation. Maps the ID of
+    /// each such earlier session to the running session that continues it.
+    static func predecessors(among live: [Int32: ClaudeSession]) -> [String: String] {
+        let liveIds = Set(live.values.map(\.sessionId))
+        var result: [String: String] = [:]
+        for (pid, session) in live {
+            guard let arguments = Procs.arguments(pid, environmentKeys: [])?.arguments,
+                  let earlier = resumeTarget(in: arguments), earlier != session.sessionId, !liveIds.contains(earlier)
+            else { continue }
+            result[earlier] = session.sessionId
+        }
+        return result
+    }
+
     /// One conversation transcript `~/.claude/projects/<project>/<id>.jsonl`, live or ended
     struct Transcript {
         let sessionId: String
