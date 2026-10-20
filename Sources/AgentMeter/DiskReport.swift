@@ -58,6 +58,8 @@ struct DiskItem: Identifiable {
     var owner: DiskOwner = .nobody
     /// What stands in the way of deleting it right now, if anything: the session is running, a process is working in it
     var blocker: String?
+    /// Work that exists only in this worktree and would be lost with it: uncommitted changes, commits no remote has
+    var atRisk: [String] = []
     /// The largest folders and files inside, largest first
     var entries: [DiskEntry] = []
 

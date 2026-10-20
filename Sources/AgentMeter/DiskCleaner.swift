@@ -2,12 +2,14 @@ import Darwin
 import Foundation
 
 /// Deletes the parts of sessions that the Disk tab marks as deletable, and, when the user explicitly consents, git-ignored
-/// files that are not known to be disposable.
+/// files that are not known to be disposable. When the user forces it, whole worktrees go even with uncommitted changes,
+/// unpushed commits and ignored files in them.
 ///
 /// A scan can be minutes old, so every part is checked again right before it is deleted and skipped if it is no
 /// longer safe: the session may be running again, a process may have started in it, a worktree may have gained
 /// changes. Only paths of the three expected shapes are ever deleted. Conversations have no removal and are never
-/// touched.
+/// touched. Forcing overrides what is about the work in a worktree, never what is about use: a running session or a
+/// process working in a folder still stops the deletion.
 enum DiskCleaner {
     struct Outcome {
         var deleted: [DiskItem] = []
@@ -18,7 +20,7 @@ enum DiskCleaner {
         var freed: UInt64 { deleted.reduce(0) { $0 + $1.bytes } }
     }
 
-    static func delete(_ items: [DiskItem], consent: Bool = false, progress: (String) -> Void) -> Outcome {
+    static func delete(_ items: [DiskItem], consent: Bool = false, force: Bool = false, progress: (String) -> Void) -> Outcome {
         var outcome = Outcome()
         let liveClaude = Set(ClaudeSessions.running().filter { Procs.read($0.key) != nil }.values.map(\.sessionId))
         let activeCodex = Set(CodexThreads.loadAll()
@@ -33,6 +35,10 @@ enum DiskCleaner {
         }
         // Whole worktrees first: they take their dependencies with them
         let ordered = items.filter(isWholeWorktree) + items.filter { !isWholeWorktree($0) }
+        let wholeWorktrees = Set(items.compactMap { item -> String? in
+            if case .worktree(let root) = item.removal { return root }
+            return nil
+        })
 
         for (index, item) in ordered.enumerated() {
             progress("Deleting \(index + 1) of \(ordered.count)…")
@@ -40,7 +46,7 @@ enum DiskCleaner {
 
             guard let removal = item.removal else { skip("Not deletable"); continue }
             // Only parts marked deletable, or ignored files the user chose to delete anyway
-            if !item.cleanable, !(consent && item.needsConsent) { skip("Not deletable"); continue }
+            if !item.cleanable, !(consent && item.needsConsent), !force { skip("Not deletable"); continue }
             switch item.owner {
             case .claude(let id) where liveClaude.contains(id): skip("The session is running again"); continue
             case .codex(let id) where activeCodex.contains(id): skip("The thread was active in the last hour"); continue
@@ -54,12 +60,21 @@ enum DiskCleaner {
             case .ignoredEntries(let root, _): location = root
             case .worktree(let root): location = root
             }
-            if case .ignoredDirectories(let root, _) = removal, outcome.removedWorktrees.contains(root) {
-                outcome.deleted.append(item)  // went with its worktree
-                continue
+            switch removal {
+            case .ignoredDirectories(let root, _), .ignoredEntries(let root, _):
+                if outcome.removedWorktrees.contains(root) {
+                    outcome.deleted.append(item)  // went with its worktree
+                    continue
+                }
+                // Forced: what is only in the worktree goes with it or stays; the worktree is not taken apart
+                if force, case .ignoredEntries = removal, wholeWorktrees.contains(root) {
+                    skip("The worktree was not removed")
+                    continue
+                }
+            default: break
             }
             if let pid = directories.first(where: { $0.path == location || $0.path.hasPrefix(location + "/") })?.pid {
-                skip("\(Procs.read(pid)?.name ?? "A process") (pid \(pid)) is running in this directory")
+                skip("\(Procs.read(pid)?.name ?? "A process") (pid \(pid)) is still running in this directory (see Processes)")
                 continue
             }
 
@@ -108,10 +123,12 @@ enum DiskCleaner {
             case .worktree(let root):
                 guard isWorktree(root) else { skip("Not a worktree"); continue }
                 guard exists(root) else { outcome.deleted.append(item); outcome.removedWorktrees.insert(root); continue }
-                guard let git = Git.state(of: root) else { skip("Git cannot read the worktree"); continue }
-                if git.changes > 0 { skip("It now has \(git.changes) uncommitted change(s)"); continue }
-                if git.unpushed > 0 { skip("It now has \(git.unpushed) commit(s) not on any remote branch"); continue }
-                guard DiskScanner.isDisposable(git) else { skip("It holds git-ignored files that would be lost"); continue }
+                if !force {
+                    guard let git = Git.state(of: root) else { skip("Git cannot read the worktree"); continue }
+                    if git.changes > 0 { skip("It now has \(git.changes) uncommitted change(s)"); continue }
+                    if git.unpushed > 0 { skip("It now has \(git.unpushed) commit(s) not on any remote branch"); continue }
+                    guard DiskScanner.isDisposable(git) else { skip("It holds git-ignored files that would be lost"); continue }
+                }
                 if let error = Git.removeWorktree(at: root) { skip(error); continue }
                 if exists(root) { skip("The directory is still there after git removed the worktree"); continue }
                 outcome.deleted.append(item)

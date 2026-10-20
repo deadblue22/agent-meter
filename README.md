@@ -184,6 +184,27 @@ changes or unpushed commits, or a directory is no longer ignored by git. Only pa
 deleted (`/tmp/claude-<uid>/<project>/<session id>`, `<repo>/.claude/worktrees/<name>`, `~/.codex/worktrees/<hash>/<repo>`),
 and never a symbolic link.
 
+#### Force Delete
+
+The last entry of a session's right-click menu, shown when the session has something the ordinary *Delete* leaves
+alone. It removes everything the session left on disk except its conversation, even when a worktree has uncommitted
+changes, commits no remote has, or git-ignored files that are not disposable. The dialog lists, for each worktree, what
+exists only on this Mac: the number of changes and commits, and the ignored files by name. The commits stay on the
+worktree's branch (a worktree on a detached HEAD has no branch to keep them). Force only overrides what is about the
+work in a worktree. It never overrides what is about use: a running session or a process working in the folder still
+stops it, with the reason shown, as does a locked worktree and any path that is not of the expected shapes. The ignored
+files of a worktree are deleted only together with it; if the worktree itself cannot be removed, they stay.
+
+#### Force Quit Session
+
+When something holds a session's files back, because it is running or a process works in one of its folders, its
+right-click menu also has *Force Quit Session…*. It ends the session process and what the process list attributes to
+it, the processes left in its worktrees, and any other process whose working directory is in one of its folders;
+the dialog names them. Shared services such as a container VM (`colima`, `limactl`, `docker`) stay running. The
+conversation is kept and can be resumed. Afterwards the disk is scanned again, so *Delete* and *Force Delete* apply
+to what was held back. A Codex thread counts as running for an hour after its last activity even when it has no
+process; there is nothing to end then, and it becomes deletable when the hour is over.
+
 ## Limitations
 
 - Disk usage: a branch that was squash-merged and deleted on the remote still has commits no remote branch contains,

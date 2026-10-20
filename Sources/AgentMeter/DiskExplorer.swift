@@ -7,10 +7,35 @@ struct DeletePlan: Identifiable {
     let items: [DiskItem]
     /// The user chose to delete git-ignored files that are not known to be disposable
     var consent = false
+    /// Forced: whole worktrees go even with work in them that exists only on this Mac
+    var force = false
+    /// Parts of the same session left out because something is using them right now
+    var held = 0
 
     var bytes: UInt64 { items.reduce(0) { $0 + $1.bytes } }
 
+    private var forceMessage: String {
+        var lines: [String] = []
+        for tree in items.filter(\.removesWorktree) {
+            var losses = tree.atRisk
+            if let ignored = items.first(where: { $0.kind == .ignored && $0.path == tree.path }) {
+                let names = ignored.entries.prefix(4).map(\.name).joined(separator: ", ")
+                losses.append("\(Format.bytes(ignored.bytes)) of files git ignores" + (names.isEmpty ? "" : " (\(names))"))
+            }
+            lines.append("• \(tree.subject ?? tree.path), \(Format.bytes(tree.bytes)): "
+                         + (losses.isEmpty ? "nothing that is not in git" : losses.joined(separator: "; ")))
+        }
+        let scratch = items.filter { $0.kind == .scratch }
+        if !scratch.isEmpty { lines.append("• Scratch files: \(scratch.count), \(Format.bytes(scratch.reduce(0) { $0 + $1.bytes }))") }
+        return "Everything this session left on disk is removed except its conversation, and what is listed here exists only on this Mac:\n"
+            + lines.joined(separator: "\n")
+            + (held > 0 ? "\n\n\(held) part(s) are in use right now and stay." : "")
+            + "\n\nWorktrees are removed with git worktree remove --force; their branches stay, and so do the commits on them. "
+            + "Each part is checked again just before it is deleted. This cannot be undone."
+    }
+
     var message: String {
+        if force { return forceMessage }
         func line(_ what: String, _ kind: DiskItem.Kind) -> String? {
             let group = items.filter { $0.kind == kind }
             return group.isEmpty ? nil : "\(what): \(group.count), \(Format.bytes(group.reduce(0) { $0 + $1.bytes }))"
@@ -279,6 +304,56 @@ final class DiskExplorer: ObservableObject {
         return items.first?.blocker
     }
 
+    /// A plan to delete everything a session left on disk but its conversation, work that exists only on this Mac
+    /// included. Nil when the ordinary delete already covers all of it, or when nothing of it is free to delete.
+    func forcePlan(for id: String) -> DeletePlan? {
+        guard let node = node(id), node.kind == .session else { return nil }
+        let parts = items(of: node).filter { $0.removal != nil }
+        let free = parts.filter { $0.blocker == nil }
+        guard free.contains(where: { !$0.cleanable }) else { return nil }
+        let bytes = Format.bytes(free.reduce(0) { $0 + $1.bytes })
+        return DeletePlan(title: "Force delete \(bytes) from “\(node.name)”?", items: free, consent: true, force: true,
+                          held: parts.count - free.count)
+    }
+
+    /// Why a forced delete of the session is not possible now, when it would have something to delete but all of it is in use
+    func forceBlocker(for id: String) -> String? {
+        guard let node = node(id), node.kind == .session else { return nil }
+        let parts = items(of: node).filter { $0.removal != nil }
+        guard parts.contains(where: { !$0.cleanable }), !parts.isEmpty, parts.allSatisfy({ $0.blocker != nil }) else { return nil }
+        return parts.first?.blocker
+    }
+
+    /// Whether something stands in the way of deleting the session's parts right now: it is running, or a process works in it
+    func isHeld(_ id: String) -> Bool {
+        guard let node = node(id), node.kind == .session else { return false }
+        return items(of: node).contains { $0.blocker != nil }
+    }
+
+    /// Looks for what would have to be ended for the session; nil, with a notice, when there is nothing to end
+    func prepareQuit(_ id: String) async -> QuitPlan? {
+        guard let session = node(id)?.session, !running else { return nil }
+        running = true
+        progress = "Looking for the session's processes…"
+        let plan = await Task.detached(priority: .userInitiated) { SessionQuit.plan(for: session) }.value
+        running = false
+        guard !plan.targets.isEmpty else {
+            notice = "No process belongs to “\(session.title)” right now."
+                + (session.source == .codex ? " A Codex thread counts as running for an hour after its last activity." : "")
+            return nil
+        }
+        return plan
+    }
+
+    /// Ends the processes, then scans again, since what held the session's files back may be gone
+    func quit(_ plan: QuitPlan) async {
+        running = true
+        progress = "Ending processes…"
+        let refs = plan.targets.map(\.ref)
+        let outcome = await Task.detached(priority: .userInitiated) { Killer.terminate(refs) }.value
+        await scan(note: "“\(plan.sessionTitle)”: \(outcome.summary)")
+    }
+
     var collectedPlan: DeletePlan? { plan(for: collected) }
 
     /// Everything that can be deleted, including sessions too small to be listed
@@ -315,12 +390,12 @@ final class DiskExplorer: ObservableObject {
         running = true
         notice = nil
         progress = "Deleting…"
-        let items = plan.items, consent = plan.consent
+        let items = plan.items, consent = plan.consent, force = plan.force
         let outcome = await Task.detached(priority: .utility) {
-            DiskCleaner.delete(items, consent: consent) { text in Task { @MainActor in self.progress = text } }
+            DiskCleaner.delete(items, consent: consent, force: force) { text in Task { @MainActor in self.progress = text } }
         }.value
         apply(outcome)
-        if plan.consent, !outcome.deleted.isEmpty {
+        if plan.consent, !plan.force, !outcome.deleted.isEmpty {
             notice = (notice ?? "") + ". Rescan to see whether the worktree itself can now be removed."
         }
         running = false
@@ -340,9 +415,9 @@ final class DiskExplorer: ObservableObject {
     }
 
     /// Scans the disk. The chart and the list fill in while it goes, from reports of what has been measured so far.
-    func scan() async {
+    func scan(note: String? = nil) async {
         running = true
-        notice = nil
+        notice = note
         progress = "Reading sessions…"
         fraction = nil
         setReport(nil)

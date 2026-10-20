@@ -11,6 +11,7 @@ private struct TrayFrameKey: PreferenceKey {
 struct DiskView: View {
     @ObservedObject var disk: DiskExplorer
     @State private var pending: DeletePlan?
+    @State private var pendingQuit: QuitPlan?
     @State private var dragging: (id: String, location: CGPoint)?
     @State private var trayFrame = CGRect.zero
     /// The width of the list on the right; dragging the handle between it and the chart changes it
@@ -48,17 +49,37 @@ struct DiskView: View {
         .environment(\.colorScheme, .dark)
         .foregroundStyle(.white)
         .frame(minWidth: 860, minHeight: 560)
-        .confirmationDialog(pending?.title ?? "",
-                            isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } }),
+        .confirmationDialog(confirmation?.title ?? "",
+                            isPresented: Binding(get: { confirmation != nil }, set: { if !$0 { pending = nil; pendingQuit = nil } }),
                             titleVisibility: .visible,
-                            presenting: pending) { plan in
-            Button("Delete \(Format.bytes(plan.bytes))", role: .destructive) {
-                Task { await disk.delete(plan) }
-            }
+                            presenting: confirmation) { confirmation in
+            Button(confirmation.button, role: .destructive, action: confirmation.action)
             Button("Cancel", role: .cancel) {}
-        } message: { plan in
-            Text(plan.message)
+        } message: { confirmation in
+            Text(confirmation.message)
         }
+    }
+
+    /// What the one confirmation dialog asks: to delete, or to end a session
+    private struct Confirmation {
+        let title: String
+        let message: String
+        let button: String
+        let action: () -> Void
+    }
+
+    private var confirmation: Confirmation? {
+        if let plan = pending {
+            return Confirmation(title: plan.title, message: plan.message,
+                                button: (plan.force ? "Force Delete " : "Delete ") + Format.bytes(plan.bytes),
+                                action: { Task { await disk.delete(plan) } })
+        }
+        if let plan = pendingQuit {
+            return Confirmation(title: plan.title, message: plan.message,
+                                button: "Force Quit (\(Format.processes(plan.targets.count)))",
+                                action: { Task { await disk.quit(plan) } })
+        }
+        return nil
     }
 
     private var start: some View {
@@ -468,6 +489,21 @@ struct DiskView: View {
                 if let plan = disk.plan(for: [id]) {
                     Button("Delete \(Format.bytes(plan.bytes))…", role: .destructive) { pending = plan }
                 }
+            }
+            // Apart from the rest: it takes what the other entries leave alone
+            if let force = disk.forcePlan(for: id) {
+                Divider()
+                Button("Force Delete \(Format.bytes(force.bytes))…", role: .destructive) { pending = force }
+            } else if let reason = disk.forceBlocker(for: id) {
+                Divider()
+                Button("Force Delete… (\(reason))") {}.disabled(true)
+            }
+            // What holds a session's files back can be ended from here
+            if disk.isHeld(id) {
+                Divider()
+                Button("Force Quit Session…", role: .destructive) {
+                    Task { pendingQuit = await disk.prepareQuit(id) }
+                }.disabled(disk.running)
             }
         }
     }

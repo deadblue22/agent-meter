@@ -230,14 +230,19 @@ enum Collector {
             case .worktree(let root):
                 // Which session made the worktree is worth saying, though it is not working in it any more
                 if transcripts == nil { transcripts = ClaudeSessions.transcripts() }
-                let creator = ClaudeSessions.creator(of: root, among: transcripts ?? []).map { transcript -> String in
+                // Named after the session that made it, the way the Disk tab lists it, so that it can be found by that name
+                let made = ClaudeSessions.creator(of: root, among: transcripts ?? [])
+                let creator = made.map { transcript -> String in
                     let live = sessionById[transcript.sessionId]?.name
                     let title = live.flatMap { $0.isEmpty ? nil : $0 } ?? ClaudeSessions.title(ofEndedSession: transcript.sessionId)
-                    return "Made by “\(title ?? "session " + transcript.sessionId.prefix(8))”"
+                    return title ?? "Session \(transcript.sessionId.prefix(8))"
                 }
+                let name = (root as NSString).lastPathComponent
                 claudeNodes.append(SessionNode(
-                    id: "worktree-\(root)", kind: .claude, title: (root as NSString).lastPathComponent,
-                    detail: [creator, "no running session works in it", shortPath(root)].compactMap { $0 }.joined(separator: " · "),
+                    id: "worktree-\(root)", kind: .claude, title: creator ?? name,
+                    detail: [made.map { sessionById[$0.sessionId] == nil ? "Session ended" : "Session works elsewhere" },
+                             "left in worktree \(name)", shortPath(root)]
+                        .compactMap { $0 }.joined(separator: " · "),
                     isBusy: false, processes: items, children: [], isUnclaimed: true))
             case .codexApp, .unattributed:
                 break

@@ -204,7 +204,7 @@ enum DiskScanner {
             if running {
                 blocker = runningNote(owner)
             } else if let pid = busyProcess(in: root) {
-                blocker = "\(Procs.read(pid)?.name ?? "A process") (pid \(pid)) is running in this directory"
+                blocker = "\(Procs.read(pid)?.name ?? "A process") (pid \(pid)) is still running in this directory (see Processes)"
             }
             var items: [DiskItem] = []
             if usage.dependencies > 0 {
@@ -213,7 +213,7 @@ enum DiskScanner {
                     cleanable: blocker == nil,
                     note: blocker ?? "\(usage.dependencyNames.prefix(3).joined(separator: ", ")): can be reinstalled, rebuilt or regenerated",
                     removal: .ignoredDirectories(root: root, paths: usage.dependencyPaths.map { root + "/" + $0 }),
-                    owner: owner, entries: entries(root, usage.dependencyEntries)))
+                    owner: owner, blocker: blocker, entries: entries(root, usage.dependencyEntries)))
             }
             if usage.ignored > 0 {
                 items.append(DiskItem(
@@ -230,10 +230,21 @@ enum DiskScanner {
                 else if !isDisposable(git) { reason = "Also holds \(Format.bytes(usage.ignored)) of ignored files" }
                 else { reason = nil }
             } else { reason = "Git cannot read this worktree" }
+            var atRisk: [String] = []
+            if let git = usage.git {
+                if git.changes > 0 { atRisk.append(count(git.changes, "uncommitted change")) }
+                if git.unpushed > 0 {
+                    atRisk.append(count(git.unpushed, "commit") + " not on any remote"
+                                  + (git.branch.isEmpty ? " and on no branch" : " (branch \(git.branch) keeps them)"))
+                }
+            } else {
+                atRisk.append("git cannot read it, so what is in it is unknown")
+            }
             items.append(DiskItem(
                 id: root + "#files", kind: .worktree, subject: subject, path: root, bytes: usage.files, cleanable: reason == nil,
                 note: reason ?? "No uncommitted changes and every commit is on a remote branch: the whole worktree can be removed",
-                removal: .worktree(root: root), owner: owner, entries: entries(root, usage.fileEntries)))
+                removal: .worktree(root: root), owner: owner, blocker: blocker, atRisk: atRisk,
+                entries: entries(root, usage.fileEntries)))
             return items
         }
 
@@ -250,10 +261,10 @@ enum DiskScanner {
             (scratch[sessionId] ?? []).compactMap { path in
                 guard let bytes = results.size(path), bytes > 0 else { return nil }
                 let blocker = running ? "The session is running"
-                    : busyProcess(in: path).map { "\(Procs.read($0)?.name ?? "A process") (pid \($0)) is running in this directory" }
+                    : busyProcess(in: path).map { "\(Procs.read($0)?.name ?? "A process") (pid \($0)) is still running in this directory (see Processes)" }
                 return DiskItem(id: path, kind: .scratch, path: path, bytes: bytes, cleanable: blocker == nil,
                                 note: blocker ?? "Temporary working files of the session", removal: .directory(path),
-                                owner: owner,
+                                owner: owner, blocker: blocker,
                                 entries: (results.breakdown(path) ?? [:]).sorted { $0.value > $1.value }.prefix(120)
                                     .map { DiskEntry(path: path + "/" + $0.key, name: $0.key, bytes: $0.value) })
             }
