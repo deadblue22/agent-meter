@@ -161,6 +161,11 @@ allocated on disk, as `du` reports; hard-linked files count once.
 A worktree shared by several sessions (a resumed conversation, or the sub-agents of a Codex thread) is shown under
 the one that was active last.
 
+Linked worktrees at custom locations, such as `<project>-wt/<task>`, are discovered through Git's worktree registry
+for repositories used by sessions. They are included in disk statistics and matched by session working directory
+or conversation references; unmatched worktrees are shown with *No session found*. Custom locations are statistics
+only and cannot be deleted from Agent Meter. Main checkouts and missing worktrees are excluded.
+
 Some worktrees are nobody's working directory: Codex agents create them by hand (`git worktree add
 ~/.codex/worktrees/<name>/<repo>`), and Claude Code sessions sometimes make one for work they run from elsewhere.
 Those are matched to the session that made them: among the sessions that were running when the directory was

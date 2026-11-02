@@ -14,6 +14,34 @@ struct GitState {
 }
 
 enum Git {
+    /// Registered linked worktrees of repositories used by sessions, regardless of their directory names.
+    /// Main checkouts, missing worktrees and symbolic links are not included.
+    static func linkedWorktrees(among directories: Set<String>) -> Set<String> {
+        var repositories = Set<String>()
+        var roots = Set<String>()
+        for directory in directories.sorted() {
+            guard let common = run(["rev-parse", "--git-common-dir"], in: directory) else { continue }
+            let name = String(decoding: common, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            let repository = URL(fileURLWithPath: name, relativeTo: URL(fileURLWithPath: directory, isDirectory: true))
+                .standardizedFileURL.resolvingSymlinksInPath().path
+            guard repositories.insert(repository).inserted,
+                  let data = run(["worktree", "list", "--porcelain", "-z"], in: directory) else { continue }
+            for field in data.split(separator: 0) {
+                let text = String(decoding: field, as: UTF8.self)
+                guard text.hasPrefix("worktree ") else { continue }
+                let root = String(text.dropFirst("worktree ".count))
+                let url = URL(fileURLWithPath: root)
+                guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                      values.isDirectory == true, values.isSymbolicLink != true,
+                      let git = try? url.appendingPathComponent(".git")
+                        .resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                      git.isRegularFile == true, git.isSymbolicLink != true else { continue }
+                roots.insert(root)
+            }
+        }
+        return roots
+    }
+
     /// nil when git cannot read the working tree (for example the repository it belongs to was deleted)
     static func state(of directory: String) -> GitState? {
         guard let status = run(["status", "--porcelain=v1", "-z", "--ignored=traditional"], in: directory),

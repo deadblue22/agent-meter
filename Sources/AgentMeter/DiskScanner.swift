@@ -7,6 +7,7 @@ import Foundation
 /// - scratch files: `/tmp/claude-<uid>/<project>/<session id>/` (Claude Code)
 /// - a worktree: `<repo>/.claude/worktrees/<name>` (Claude Code) or `~/.codex/worktrees/<hash>/<repo>` (Codex),
 ///   including those a sub-agent created
+/// - linked worktrees at custom locations registered with repositories used by sessions (statistics only)
 /// - nothing else; the transcript itself is history and is never offered for deletion
 ///
 /// Rules for what is cleanable, all of which need the session not to be running and no process to be working in the
@@ -162,6 +163,22 @@ enum DiskScanner {
                 if codexOwner[root] == nil, fm.fileExists(atPath: root + "/.git") { unmatched.append(root) }
             }
         }
+        // Git also knows about worktrees at custom locations, such as <project>-wt/<task>.
+        let managedRoots = Set(claudeOwner.keys).union(codexOwner.keys).union(unmatched).union(claudeUnmatched)
+        let directories = Set(transcripts.compactMap(\.cwd)).union(threads.map(\.cwd))
+        let customRoots = Git.linkedWorktrees(among: directories).subtracting(managedRoots)
+        var customOwners: [String: DiskOwner] = [:]
+        for root in customRoots {
+            let claude = transcripts.filter { $0.cwd == root || $0.cwd?.hasPrefix(root + "/") == true }
+                .max { $0.modified < $1.modified }
+            let codex = threads.filter { $0.cwd == root || $0.cwd.hasPrefix(root + "/") }
+                .max { $0.updatedAt < $1.updatedAt }
+            if let claude, claude.modified > (codex?.updatedAt ?? .distantPast) {
+                customOwners[root] = .claude(claude.sessionId)
+            } else if let codex {
+                customOwners[root] = .codex(codex.id)
+            }
+        }
         // Measure everything a few jobs at a time so the disk is not saturated. The quick jobs go first, so that
         // there is something to show early.
         // Worktrees an agent made by hand are in no thread's `cwd`; which thread made one is worked out in the same
@@ -169,6 +186,17 @@ enum DiskScanner {
         let results = Results()
         let creators = Results()
         var jobs: [(weight: Int, run: () -> Void)] = []
+        let customCreators = Results()
+        for root in customRoots where customOwners[root] == nil {
+            jobs.append((weight: 4, run: {
+                if let id = creator(of: root, among: threads) {
+                    customCreators.store(owner: "codex-" + id, at: root)
+                } else {
+                    customCreators.store(owner: ClaudeSessions.creator(of: root, among: transcripts)
+                        .map { "claude-" + $0.sessionId }, at: root)
+                }
+            }))
+        }
         for root in unmatched {
             jobs.append((weight: 4, run: { creators.store(owner: creator(of: root, among: threads), at: root) }))
         }
@@ -188,7 +216,7 @@ enum DiskScanner {
             }))
         }
         // A worktree takes much longer than a scratch directory, so it counts for more in the progress bar
-        for root in Set(claudeOwner.keys).union(codexOwner.keys).union(unmatched).union(claudeUnmatched) {
+        for root in managedRoots.union(customRoots) {
             jobs.append((weight: 15, run: { results.store(worktree: analyze(root), at: root) }))
         }
 
@@ -206,6 +234,7 @@ enum DiskScanner {
             } else if let pid = busyProcess(in: root) {
                 blocker = "\(Procs.read(pid)?.name ?? "A process") (pid \(pid)) is still running in this directory (see Processes)"
             }
+            if customRoots.contains(root) { blocker = "Custom worktree location: statistics only" }
             var items: [DiskItem] = []
             if usage.dependencies > 0 {
                 items.append(DiskItem(
@@ -245,7 +274,11 @@ enum DiskScanner {
                 note: reason ?? "No uncommitted changes and every commit is on a remote branch: the whole worktree can be removed",
                 removal: .worktree(root: root), owner: owner, blocker: blocker, atRisk: atRisk,
                 entries: entries(root, usage.fileEntries)))
-            return items
+            return items.map { item in
+                var item = item
+                if customRoots.contains(root) { item.removal = nil }
+                return item
+            }
         }
 
         func entries(_ base: String, _ list: [(name: String, bytes: UInt64)]) -> [DiskEntry] {
@@ -289,6 +322,22 @@ enum DiskScanner {
             var codexNow = codexOwner
             var claudeNow = claudeOwner
             var orphans: [String] = []
+            for root in customRoots {
+                var owner = customOwners[root]
+                if owner == nil {
+                    switch customCreators.decision(root) {
+                    case .some(.some(let id)):
+                        owner = id.hasPrefix("codex-") ? .codex(String(id.dropFirst(6))) : .claude(String(id.dropFirst(7)))
+                    case .some(.none): orphans.append(root)
+                    case .none: break
+                    }
+                }
+                switch owner {
+                case .codex(let id): codexNow[root] = id
+                case .claude(let id): claudeNow[root] = (id, Date())
+                default: break
+                }
+            }
             for root in claudeUnmatched {
                 switch creators.decision(root) {
                 case .some(.some(let id)): claudeNow[root] = (id, Date())
@@ -421,7 +470,8 @@ enum DiskScanner {
     private static func creator(of root: String, among threads: [CodexThread]) -> String? {
         let attributes = try? FileManager.default.attributesOfItem(atPath: root)
         guard let born = attributes?[.creationDate] as? Date else { return nil }
-        let key = Array(".codex/worktrees/\(root.split(separator: "/").suffix(2).first ?? "")/".utf8)
+        let key = Array((root.contains("/.codex/worktrees/")
+            ? ".codex/worktrees/\(root.split(separator: "/").suffix(2).first ?? "")/" : root).utf8)
         let slack: TimeInterval = 600
         let candidates = threads.filter {
             $0.createdAt <= born.addingTimeInterval(slack) && born.addingTimeInterval(-slack) <= $0.updatedAt

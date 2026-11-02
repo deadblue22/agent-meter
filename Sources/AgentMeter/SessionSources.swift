@@ -120,7 +120,8 @@ enum ClaudeSessions {
     static func creator(of root: String, among transcripts: [Transcript]) -> Transcript? {
         guard let born = (try? FileManager.default.attributesOfItem(atPath: root))?[.creationDate] as? Date else { return nil }
         let slack: TimeInterval = 600
-        let key = Array("/worktrees/\((root as NSString).lastPathComponent)".utf8)
+        let key = Array((root.contains("/.claude/worktrees/")
+            ? "/worktrees/\((root as NSString).lastPathComponent)" : root).utf8)
         var best: (transcript: Transcript, when: Date)?
         for transcript in transcripts
             where transcript.created <= born.addingTimeInterval(slack) && transcript.modified >= born.addingTimeInterval(-slack) {
